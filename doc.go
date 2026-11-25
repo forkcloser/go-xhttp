@@ -49,4 +49,7 @@
 //   - [ErrRedirect]: a redirect was not followed.
 //
 // Every other error is the standard library's and passes through unchanged.
+//
+// The retry subpackage wraps any transport with retries of what is safe to
+// send again.
 package xhttp
