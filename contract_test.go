@@ -18,9 +18,20 @@ package xhttp_test
 //   - the caller's request is left as it was, and is the response's Request;
 //     a trailer the caller sets while the body is read is sent;
 //   - UserAgent is the User-Agent of a request that has no such header;
-//   - a Credential is sent to the hosts it names, over https, and to no
-//     other, a redirect's target included; a request's own Authorization
-//     header is kept; a credential with no token is not sent;
+//   - a Credential is made by NewCredential from a scheme that is an HTTP
+//     token (RFC 9110, 5.6.2 and 11.1), a token that net/http sends as it
+//     is in a header field (5.5: any octet but a control character other
+//     than a tab, and nothing blank at an end), and one host or more, each written in ASCII as a URL writes it
+//     (RFC 3986, 3.2.2: a name, an IPv4 address or an IPv6 address in
+//     brackets, alone or with a port; no zone, which RFC 6874 writes one
+//     way and net/url gives back another). Anything else is ErrCredential,
+//     and the error does not hold the token;
+//   - a credential goes with a request exactly when the request is https,
+//     its URL writes its host in ASCII, and net/http dials for it the
+//     address it dials for one of the credential's hosts over https: so not
+//     to another host, a redirect's target included, and not in cleartext.
+//     Of two credentials for a host the first is sent; a request's own
+//     Authorization header is kept; the zero Credential is never sent;
 //   - Redirects follows at most its limit, and none from https to anything
 //     else: both are ErrRedirect;
 //   - an error that is not the posture's is the standard library's, unchanged.
@@ -588,7 +599,7 @@ func TestTheCallersRequestIsLeftAsItWas(t *testing.T) {
 		"a transport": bare,
 		"a transport with a credential": xhttp.Authorize(
 			bare,
-			xhttp.Credential{Token: "token", Hosts: []string{strings.TrimPrefix(server.URL, "https://")}},
+			credential(t, "Bearer", "token", strings.TrimPrefix(server.URL, "https://")),
 		),
 	} {
 		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, http.NoBody)
@@ -711,8 +722,7 @@ func TestCredentialGoesToItsHostsOnly(t *testing.T) {
 	client := &http.Client{
 		Transport: xhttp.Authorize(
 			xhttp.NewTransport(xhttp.Config{Roots: roots, Cleartext: true}),
-			xhttp.Credential{Hosts: []string{hostOf(first.URL), hostOf(other.URL), hostOf(plain.URL)}},
-			xhttp.Credential{Token: "for-the-first-host", Hosts: []string{hostOf(first.URL), hostOf(plain.URL)}},
+			credential(t, "Bearer", "for-the-first-host", hostOf(first.URL), hostOf(plain.URL)),
 		),
 	}
 
@@ -734,7 +744,7 @@ func TestCredentialGoesToItsHostsOnly(t *testing.T) {
 	}{
 		{"the named host", first.URL + "/", &named, token},
 		{"a redirect to another host", first.URL + "/away", &elsewhere, ""},
-		{"a host only a credential with no token names", other.URL, &elsewhere, ""},
+		{"a host no credential names", other.URL, &elsewhere, ""},
 		{"a named host in cleartext", plain.URL, &elsewhere, ""},
 	} {
 		if _, err := get(t.Context(), t, client, step.address); err != nil {
@@ -828,7 +838,7 @@ func TestATrailerSetWhileTheBodyIsReadIsSent(t *testing.T) {
 		"a transport": bare,
 		"a transport with a credential": xhttp.Authorize(
 			bare,
-			xhttp.Credential{Token: "token", Hosts: []string{strings.TrimPrefix(server.URL, "https://")}},
+			credential(t, "Bearer", "token", strings.TrimPrefix(server.URL, "https://")),
 		),
 	} {
 		req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, server.URL, http.NoBody)

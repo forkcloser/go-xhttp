@@ -24,7 +24,7 @@ client.Transport = retry.NewTransport(client.Transport, retry.Options{Retries: 3
 | Key exchange | `HybridOnly`: TLS 1.3, post-quantum hybrids only | `Classical`, `Legacy`, for the whole transport |
 | Stalled body | a read that waits a minute for a byte fails with `ErrStalled` | `Config.StallTimeout`, negative to wait for ever |
 | Redirects | at most 10, none from https to anything else | `Redirects(limit)` on a client of your own |
-| Credential | sent over https to the hosts it names, and to no other | `Credential.Hosts` |
+| Credential | sent over https to the hosts it names, and to no other | the hosts given to `NewCredential` |
 | Offline | off | `Config.Offline` |
 
 A transport has one key exchange level, for every connection it makes: a
