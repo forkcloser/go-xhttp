@@ -94,14 +94,8 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 
 		// What the attempt ended in: its error, or the status of a response,
-		// which is given up here. Closed and not read: a read waits for what
-		// the server has yet to send, for as long as the server likes.
-		status := 0
-		if resp != nil {
-			status = resp.StatusCode
-
-			_ = resp.Body.Close()
-		}
+		// which is given up here.
+		status := release(resp)
 
 		t.log(req, status, err, retry, wait)
 
@@ -123,6 +117,23 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	return resp, err //nolint:wrapcheck // the base's own error, unchanged
+}
+
+// release gives up a response, if there is one, and returns its status.
+// Closed and not read: a read waits for what the server has yet to send, for
+// as long as the server likes.
+func release(resp *http.Response) int {
+	if resp == nil {
+		return 0
+	}
+
+	// Some transports give a response with no content a nil Body, which
+	// net/http's client takes for an empty one.
+	if resp.Body != nil {
+		_ = resp.Body.Close()
+	}
+
+	return resp.StatusCode
 }
 
 // CloseIdleConnections forwards to base.

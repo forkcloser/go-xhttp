@@ -828,6 +828,30 @@ func TestABaseThatAnswersNothing(t *testing.T) {
 	}
 }
 
+// TestAResponseWithNoBody: a base may give a response a nil Body, which
+// net/http's client takes for an empty one (https://go.dev/issue/38095). A
+// retry gives such a response up as any other.
+func TestAResponseWithNoBody(t *testing.T) {
+	t.Parallel()
+
+	var attempts int
+
+	bodiless := roundTripper(func(req *http.Request) (*http.Response, error) {
+		attempts++
+
+		if attempts == 1 {
+			return &http.Response{StatusCode: http.StatusServiceUnavailable, Header: http.Header{}, Request: req}, nil
+		}
+
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody, Request: req}, nil
+	})
+
+	if status, err := send(t, bodiless, quick(1), http.MethodGet, nil); status != http.StatusOK || err != nil ||
+		attempts != 2 {
+		t.Errorf("%d, %v after %d attempts; want 200 after 2", status, err, attempts)
+	}
+}
+
 // records is a slog handler that keeps what it is given.
 type records struct {
 	mu   sync.Mutex
