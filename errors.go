@@ -22,7 +22,9 @@ var (
 	// not begin once the request was sent, or the response's body stopped
 	// arriving.
 	ErrStalled = errors.New("the server went silent")
-	// ErrRedirect is the error of a redirect the client does not follow.
+	// ErrRedirect is the error of a redirect that is not followed: one that
+	// leads from https to another scheme, which no transport carries, and
+	// one past the ten a client from [NewClient] follows.
 	ErrRedirect = errors.New("redirect refused")
 	// ErrCredential is the error of [NewCredential] for what would not
 	// arrive as it is, or could never match a request.

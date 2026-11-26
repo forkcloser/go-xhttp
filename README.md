@@ -23,7 +23,7 @@ client.Transport = retry.NewTransport(client.Transport, retry.Options{Retries: 3
 | Scheme | https only, `ErrCleartext` otherwise | `Config.Cleartext` |
 | TLS | `HybridOnly`: TLS 1.3, post-quantum hybrid key exchanges only | `Config.TLS`: `Classical`, `Legacy`, for the whole transport |
 | Silent server | a request the server stops taking for a minute, a response that has not begun a minute after the request was sent, or a read of its body that waits a minute for a byte, fails with `ErrStalled` | `Config.StallTimeout`, negative to wait for ever |
-| Redirects | at most 10, none from https to anything else | `Redirects(limit)` on a client of your own |
+| Redirects | none from https to anything else, under any client; at most 10 under `NewClient` | a client of your own, for another limit |
 | Credential | sent over https to the hosts it names, and to no other, nor after a redirect from a host it does not name | the hosts given to `NewCredential` |
 | Offline | off | `Config.Offline` |
 

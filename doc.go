@@ -24,8 +24,9 @@
 //   - trusts the system's roots and takes its proxy from the environment,
 //     unless [Config.Roots] or [Config.Proxy] say otherwise.
 //
-// A client from [NewClient] also follows at most ten redirects,
-// and none from https to anything else ([Redirects]). [Authorize] adds a
+// A transport carries no request that a redirect leads to from https to
+// anything else, whatever client follows the redirect, and a client from
+// [NewClient] follows at most ten: both are [ErrRedirect]. [Authorize] adds a
 // token to the requests for the hosts its [Credential] names, over https, and
 // to no other request, nor to one a redirect from another host led to.
 //
@@ -44,7 +45,8 @@
 //   - [ErrStalled]: the server went silent, in the middle of the request,
 //     before its response, or in the middle of its body. What was read of a
 //     body is the caller's, and so is asking for the rest.
-//   - [ErrRedirect]: a redirect was not followed.
+//   - [ErrRedirect]: a redirect was not followed: it led from https to
+//     another scheme, or it was one too many.
 //   - [ErrCredential]: [NewCredential] was given what would not arrive as
 //     it is, or could never match. Fix the argument the error names.
 //

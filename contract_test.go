@@ -39,11 +39,11 @@ package xhttp_test
 //   - a Credential is made by NewCredential from a scheme that is an HTTP
 //     token (RFC 9110, 5.6.2 and 11.1), a token that net/http sends as it
 //     is in a header field (5.5: any octet but a control character other
-//     than a tab, and nothing blank at an end), and one host or more, each written in ASCII as a URL writes it
-//     (RFC 3986, 3.2.2: a name, an IPv4 address or an IPv6 address in
-//     brackets, alone or with a port; no zone, which RFC 6874 writes one
-//     way and net/url gives back another). Anything else is ErrCredential,
-//     and the error does not hold the token;
+//     than a tab, and nothing blank at an end), and one host or more, each
+//     written in ASCII as a URL writes it (RFC 3986, 3.2.2: a name, an IPv4
+//     address or an IPv6 address in brackets, alone or with a port; no zone,
+//     which RFC 6874 writes one way and net/url gives back another).
+//     Anything else is ErrCredential, and the error does not hold the token;
 //   - a credential goes with a request exactly when the request is https,
 //     its URL writes its host in ASCII, and net/http dials for it the
 //     address it dials for one of the credential's hosts over https: so not
@@ -59,8 +59,11 @@ package xhttp_test
 //     token: under every verb of fmt, where fmt asks the value (fmt:
 //     Formatter) and where it reads the fields itself (a value in an
 //     unexported field), and so through log/slog and encoding/json;
-//   - Redirects follows at most its limit, and none from https to anything
-//     else: both are ErrRedirect;
+//   - no transport carries a request that a redirect leads to from https
+//     to another scheme, whatever client follows it and whatever Cleartext
+//     says (net/http, Request.Response: "the redirect response which caused
+//     this request to be created"); a client from NewClient follows ten
+//     redirects and no more; both are ErrRedirect;
 //   - an error that is not the posture's is the standard library's, unchanged.
 //
 // That nothing reads or writes a global has no test: a read of
@@ -77,6 +80,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1398,30 +1402,180 @@ func TestCredentialGoesToItsHostsOnly(t *testing.T) {
 	expect("a request with its own header", &own, "Basic the-caller's")
 }
 
-func TestRedirectsWithinHTTPSOnly(t *testing.T) {
+// TestNoRedirectLeavesHTTPS: every chain of up to three redirects between an
+// https server and a cleartext one, under a transport that sends cleartext,
+// through a client of the caller's own with no redirect policy, one that
+// allows everything, and NewClient's. A chain is followed up to the first
+// redirect that leads from https to cleartext, which is ErrRedirect, and the
+// request it leads to is never sent.
+func TestNoRedirectLeavesHTTPS(t *testing.T) {
 	t.Parallel()
 
-	plain := httptest.NewServer(http.HandlerFunc(ok))
-	t.Cleanup(plain.Close)
+	var (
+		mu   sync.Mutex
+		seen = map[string][]string{}
+	)
 
-	server, roots := secure(t, func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/down":
-			http.Redirect(w, r, plain.URL, http.StatusFound)
-		case "/once":
-			http.Redirect(w, r, "/", http.StatusFound)
+	addresses := map[string]string{}
+
+	// Each request names its chain and the schemes still to go through.
+	handler := func(scheme string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			chain, left := r.URL.Query().Get("chain"), r.URL.Query().Get("left")
+
+			mu.Lock()
+
+			seen[chain] = append(seen[chain], scheme)
+			mu.Unlock()
+
+			if left == "" {
+				return
+			}
+
+			next, rest, _ := strings.Cut(left, ",")
+
+			http.Redirect(w, r, addresses[next]+"/?chain="+url.QueryEscape(chain)+"&left="+rest, http.StatusFound)
 		}
-	}, nil)
-
-	// Cleartext, so that the redirect is what refuses, not the transport.
-	client := xhttp.NewClient(xhttp.Config{Roots: roots, Cleartext: true})
-
-	if status, err := get(t.Context(), t, client, server.URL+"/once"); err != nil || status != http.StatusOK {
-		t.Errorf("one redirect within https = %d, %v; want 200", status, err)
 	}
 
-	if _, err := get(t.Context(), t, client, server.URL+"/down"); !errors.Is(err, xhttp.ErrRedirect) {
-		t.Errorf("a redirect from https to http = %v, want ErrRedirect", err)
+	secured, roots := secure(t, handler("https"), nil)
+
+	plain := httptest.NewServer(handler("http"))
+	t.Cleanup(plain.Close)
+
+	addresses["https"], addresses["http"] = secured.URL, plain.URL
+
+	config := xhttp.Config{Roots: roots, Cleartext: true}
+
+	clients := map[string]*http.Client{
+		"a client with no policy": {Transport: xhttp.NewTransport(config)},
+		"a client that follows everything": {
+			Transport:     xhttp.NewTransport(config),
+			CheckRedirect: func(*http.Request, []*http.Request) error { return nil },
+		},
+		"NewClient": xhttp.NewClient(config),
+	}
+
+	var chains [][]string
+
+	for _, first := range []string{"https", "http"} {
+		chains = append(chains, []string{first})
+	}
+
+	for at := 0; at < len(chains); at++ {
+		if len(chains[at]) > 3 {
+			continue
+		}
+
+		for _, next := range []string{"https", "http"} {
+			chains = append(chains, append(slices.Clone(chains[at]), next))
+		}
+	}
+
+	for name, client := range clients {
+		for _, chain := range chains {
+			// What is sent: the chain up to its first step from https to
+			// cleartext.
+			sent, refused := chain, false
+
+			for at := 1; at < len(chain); at++ {
+				if chain[at-1] == "https" && chain[at] == "http" {
+					sent, refused = chain[:at], true
+
+					break
+				}
+			}
+
+			id := name + ": " + strings.Join(chain, " to ")
+
+			address := addresses[chain[0]] + "/?chain=" + url.QueryEscape(id) + "&left=" + strings.Join(chain[1:], ",")
+
+			status, err := get(t.Context(), t, client, address)
+
+			switch {
+			case refused && !errors.Is(err, xhttp.ErrRedirect):
+				t.Errorf("%s: %d, %v; want ErrRedirect", id, status, err)
+			case !refused && (err != nil || status != http.StatusOK):
+				t.Errorf("%s: %d, %v; want 200", id, status, err)
+			}
+
+			mu.Lock()
+
+			if !slices.Equal(seen[id], sent) {
+				t.Errorf("%s: the servers saw %v, want %v", id, seen[id], sent)
+			}
+
+			mu.Unlock()
+		}
+	}
+
+	// Under a transport that sends no cleartext at all, it is still the
+	// redirect that is refused.
+	strict := &http.Client{Transport: xhttp.NewTransport(xhttp.Config{Roots: roots})}
+
+	if _, err := get(
+		t.Context(),
+		t,
+		strict,
+		secured.URL+"/?chain=strict&left=http",
+	); !errors.Is(
+		err,
+		xhttp.ErrRedirect,
+	) {
+		t.Errorf("with no cleartext allowed, https to http: %v, want ErrRedirect", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if !slices.Equal(seen["strict"], []string{"https"}) {
+		t.Errorf(
+			"with no cleartext allowed, https to http: the servers saw %v, want the first request alone",
+			seen["strict"],
+		)
+	}
+}
+
+// TestARedirectFromNowhereDoesNotLeaveHTTPS: a request made on a redirect
+// whose response names no request, or a request with no URL, is taken to
+// come from https, and is not carried to another scheme.
+func TestARedirectFromNowhereDoesNotLeaveHTTPS(t *testing.T) {
+	t.Parallel()
+
+	var reached atomic.Int32
+
+	plain := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached.Add(1) }))
+	t.Cleanup(plain.Close)
+
+	transport := xhttp.NewTransport(xhttp.Config{Cleartext: true})
+
+	for what, via := range map[string]*http.Response{
+		"no request":            {StatusCode: http.StatusFound, Body: http.NoBody},
+		"a request with no URL": {StatusCode: http.StatusFound, Body: http.NoBody, Request: &http.Request{}},
+	} {
+		body := &closing{Reader: strings.NewReader("content")}
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, plain.URL, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		req.Response = via
+
+		resp, err := transport.RoundTrip(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+
+		if !errors.Is(err, xhttp.ErrRedirect) || reached.Load() != 0 || !body.closed.Load() {
+			t.Errorf(
+				"a redirect with %s: %v, the server reached %d times, the body closed: %t; want ErrRedirect, none, and closed",
+				what,
+				err,
+				reached.Load(),
+				body.closed.Load(),
+			)
+		}
 	}
 }
 

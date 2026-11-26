@@ -111,6 +111,12 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("%w: %s was asked", ErrOffline, req.URL.Host)
 	}
 
+	if downgraded(req) {
+		closeBody(req)
+
+		return nil, fmt.Errorf("%w: from https to %s://%s", ErrRedirect, req.URL.Scheme, req.URL.Host)
+	}
+
 	if req.URL.Scheme != https && !t.cleartext {
 		closeBody(req)
 
@@ -197,6 +203,19 @@ func (t *transport) outgoing(ctx context.Context, req *http.Request, awaited *aw
 	}
 
 	return sent
+}
+
+// downgraded reports a request a redirect leads to from https, that is not
+// https itself. A client sets Response on a request it makes by following a
+// redirect, and that response's Request is the request before. A response
+// that names no request is taken for one that came over https.
+func downgraded(req *http.Request) bool {
+	via := req.Response
+	if via == nil || req.URL.Scheme == https {
+		return false
+	}
+
+	return via.Request == nil || via.Request.URL == nil || via.Request.URL.Scheme == https
 }
 
 // closeBody is the part of a RoundTripper's contract that holds on a request

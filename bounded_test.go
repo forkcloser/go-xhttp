@@ -2,8 +2,7 @@ package xhttp_test
 
 // The walk within the bound: every level against a server of every offer;
 // every form of host a credential names against every form of URL; a
-// redirect limit at zero, at one and at the default, each at the limit and
-// one past it.
+// number of redirects up to NewClient's limit, and one past it.
 
 import (
 	"context"
@@ -760,8 +759,8 @@ func TestAuthorizeNeedsABase(t *testing.T) {
 	xhttp.Authorize(nil)
 }
 
-// TestRedirectLimit: a client follows as many redirects as its limit, and
-// refuses the one after.
+// TestRedirectLimit: a client from NewClient follows ten redirects, each
+// number of them up to ten, and refuses the eleventh.
 func TestRedirectLimit(t *testing.T) {
 	t.Parallel()
 
@@ -772,39 +771,29 @@ func TestRedirectLimit(t *testing.T) {
 		}
 	}, nil)
 
-	transport := xhttp.NewTransport(xhttp.Config{Roots: roots})
+	client := xhttp.NewClient(xhttp.Config{Roots: roots})
 
-	// ten is what a client from NewClient follows, by its docs.
+	// What the docs give.
 	const ten = 10
 
-	for _, limit := range []int{-1, 0, 1, ten} {
-		client := &http.Client{Transport: transport, CheckRedirect: xhttp.Redirects(limit)}
-
-		for hops := range max(limit, 0) + 2 {
-			status, err := get(t.Context(), t, client, server.URL+"/?left="+strconv.Itoa(hops))
-
-			switch {
-			case hops <= limit && (err != nil || status != http.StatusOK):
-				t.Errorf("limit %d, %d redirects = %d, %v; want 200", limit, hops, status, err)
-			case hops > max(limit, 0) && !errors.Is(err, xhttp.ErrRedirect):
-				t.Errorf("limit %d, %d redirects = %d, %v; want ErrRedirect", limit, hops, status, err)
-			case hops == 0 && (err != nil || status != http.StatusOK):
-				t.Errorf("limit %d, no redirect = %d, %v; want 200", limit, status, err)
-			}
+	for hops := range ten + 1 {
+		if status, err := get(t.Context(), t, client, server.URL+"/?left="+strconv.Itoa(hops)); err != nil ||
+			status != http.StatusOK {
+			t.Errorf("%d redirects = %d, %v; want 200", hops, status, err)
 		}
-	}
-
-	byDefault := xhttp.NewClient(xhttp.Config{Roots: roots})
-
-	atLimit := server.URL + "/?left=" + strconv.Itoa(ten)
-	if status, err := get(t.Context(), t, byDefault, atLimit); err != nil || status != http.StatusOK {
-		t.Errorf("NewClient, %d redirects = %d, %v; want 200", ten, status, err)
 	}
 
 	// One more, exactly: a client that followed eleven would pass a test of
 	// a hundred.
-	pastLimit := server.URL + "/?left=" + strconv.Itoa(ten+1)
-	if _, err := get(t.Context(), t, byDefault, pastLimit); !errors.Is(err, xhttp.ErrRedirect) {
-		t.Errorf("NewClient, %d redirects = %v, want ErrRedirect", ten+1, err)
+	if _, err := get(
+		t.Context(),
+		t,
+		client,
+		server.URL+"/?left="+strconv.Itoa(ten+1),
+	); !errors.Is(
+		err,
+		xhttp.ErrRedirect,
+	) {
+		t.Errorf("%d redirects = %v, want ErrRedirect", ten+1, err)
 	}
 }

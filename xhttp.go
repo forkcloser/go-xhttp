@@ -37,31 +37,22 @@ type Config struct {
 	Offline bool
 }
 
-// NewClient returns a client on a transport under config, which follows
-// redirects as [Redirects] does, ten of them. It panics as [NewTransport]
+// NewClient returns a client on a transport under config, which follows at
+// most ten redirects: one more is [ErrRedirect]. It panics as [NewTransport]
 // does.
 func NewClient(config Config) *http.Client {
-	const redirects = 10
+	const most = 10
 
 	return &http.Client{
-		Transport:     NewTransport(config),
-		CheckRedirect: Redirects(redirects),
-	}
-}
+		Transport: NewTransport(config),
+		// via is the requests made so far: the first, and one for each
+		// redirect followed.
+		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
+			if len(via) > most {
+				return fmt.Errorf("%w: more than %d", ErrRedirect, most)
+			}
 
-// Redirects is an http.Client.CheckRedirect that follows at most limit
-// redirects, and none from https to anything else: either is [ErrRedirect].
-// A redirect it lets through is still the transport's to carry.
-func Redirects(limit int) func(*http.Request, []*http.Request) error {
-	return func(req *http.Request, via []*http.Request) error {
-		if len(via) > limit {
-			return fmt.Errorf("%w: more than %d", ErrRedirect, limit)
-		}
-
-		if req.URL.Scheme != https && via[len(via)-1].URL.Scheme == https {
-			return fmt.Errorf("%w: from https to %s://%s", ErrRedirect, req.URL.Scheme, req.URL.Host)
-		}
-
-		return nil
+			return nil
+		},
 	}
 }
