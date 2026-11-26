@@ -15,6 +15,8 @@ package retry_test
 //   - nothing is sent again once the request's context is done, for a
 //     certificate that is not trusted, for a host that does not resolve, or
 //     for what xhttp refuses: ErrOffline, ErrCleartext, ErrHandshakeRefused;
+//     nor a request with no URL or no header map (RoundTripper: "The
+//     Request's URL and Header fields must be initialized");
 //   - a request that is not sent again keeps the answer it has, as its
 //     transport gave it: the response whatever the status, or the error
 //     unchanged. That is when no retry is left, when Retry-After asks for
@@ -901,6 +903,32 @@ func TestAResponseWithNoBody(t *testing.T) {
 	if status, err := send(t, bodiless, quick(1), http.MethodGet, nil); status != http.StatusOK || err != nil ||
 		attempts != 2 {
 		t.Errorf("%d, %v after %d attempts; want 200 after 2", status, err, attempts)
+	}
+}
+
+// TestARequestNotInitializedIsRefusedOnce: a request with no URL, or no
+// header map, is the transport's under it to refuse, and is given to it
+// once.
+func TestARequestNotInitializedIsRefusedOnce(t *testing.T) {
+	t.Parallel()
+
+	for what, edit := range map[string]func(*http.Request){
+		"no URL":        func(req *http.Request) { req.URL = nil },
+		"no header map": func(req *http.Request) { req.Header = nil },
+	} {
+		standard := &http.Transport{}
+		t.Cleanup(standard.CloseIdleConnections)
+
+		base := &counting{base: standard}
+
+		if _, err := send(t, base, quick(3), http.MethodGet, edit); err == nil || base.count.Load() != 1 {
+			t.Errorf(
+				"a request with %s: %v after %d attempts, want net/http's error after 1",
+				what,
+				err,
+				base.count.Load(),
+			)
+		}
 	}
 }
 

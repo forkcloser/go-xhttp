@@ -72,8 +72,8 @@ type transport struct {
 func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	resp, err := t.base.RoundTrip(req)
 
-	// A request with no URL is the base's to refuse, once.
-	if req.URL == nil || !rewindable(req) {
+	// A request with no URL or no header map is the base's to refuse, once.
+	if req.URL == nil || req.Header == nil || !rewindable(req) {
 		return resp, err //nolint:wrapcheck // the base's own error, unchanged
 	}
 

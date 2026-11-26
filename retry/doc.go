@@ -22,8 +22,10 @@
 // A failure no further attempt changes: the request's context is done; the
 // certificate is not trusted; the host does not resolve; xhttp refused the
 // request (xhttp.ErrOffline, xhttp.ErrCleartext) or the server refused the
-// TLS handshake (xhttp.ErrHandshakeRefused). Every other error is taken for
-// one that may pass.
+// TLS handshake (xhttp.ErrHandshakeRefused); the request has no URL or no
+// header map, which an http.RoundTripper is owed. Every other error is taken
+// for one that may pass, one of the request's own making included: net/http
+// gives those no type to tell them by.
 //
 // # What comes back
 //
