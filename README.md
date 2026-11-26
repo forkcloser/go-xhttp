@@ -8,8 +8,8 @@ program does.
 
 ```go
 import (
-	"github.com/forkcloser/xhttp"
-	"github.com/forkcloser/xhttp/retry"
+	"github.com/forkcloser/go-xhttp"
+	"github.com/forkcloser/go-xhttp/retry"
 )
 
 client := xhttp.NewClient(xhttp.Config{})
@@ -69,8 +69,8 @@ jittered backoff, obeys `Retry-After` up to `Options.MaxBackoff`, and returns
 the last attempt's response whatever its status: the status is the caller's
 to read, as with any `http.RoundTripper`.
 
-The package docs hold the whole contract: `go doc github.com/forkcloser/xhttp`
-and `go doc github.com/forkcloser/xhttp/retry`.
+The package docs hold the whole contract: `go doc github.com/forkcloser/go-xhttp`
+and `go doc github.com/forkcloser/go-xhttp/retry`.
 
 ## Developing
 

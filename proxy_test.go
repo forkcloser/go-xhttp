@@ -16,7 +16,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/forkcloser/xhttp"
+	"github.com/forkcloser/go-xhttp"
 )
 
 var errNoProxy = errors.New("the stand-in picked no proxy")

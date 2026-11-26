@@ -95,7 +95,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/forkcloser/xhttp"
+	"github.com/forkcloser/go-xhttp"
 )
 
 // secure is an https server whose TLS configure may narrow, and the roots

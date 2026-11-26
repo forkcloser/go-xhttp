@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/forkcloser/xhttp"
+	"github.com/forkcloser/go-xhttp"
 )
 
 // The Backoff and the MaxBackoff of Options that name none.

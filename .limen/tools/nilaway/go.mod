@@ -1,6 +1,6 @@
 // nilaway's own module: its dependency graph stays exactly its upstream's,
 // which a shared tools module could not promise (book/tooling.md).
-module github.com/forkcloser/xhttp/tools/nilaway
+module github.com/forkcloser/go-xhttp/tools/nilaway
 
 go 1.26.0
 

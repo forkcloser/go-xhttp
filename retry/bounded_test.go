@@ -14,7 +14,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/forkcloser/xhttp/retry"
+	"github.com/forkcloser/go-xhttp/retry"
 )
 
 // TestMethods: an idempotent method is sent again after a 503 and after an

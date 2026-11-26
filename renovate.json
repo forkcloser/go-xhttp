@@ -6,7 +6,7 @@
     "gitIgnoredAuthors: the update-aqua-checksum workflow pushes a fix-up commit onto Renovate's branches as github-actions[bot]; without this, Renovate treats the branch as human-modified and stops rebasing it. The `renovate` rule keeps the address here."
   ],
   "extends": [
-    "local>forkcloser/xhttp//.limen/renovate"
+    "local>forkcloser/go-xhttp//.limen/renovate"
   ],
   "forkProcessing": "enabled",
   "gitIgnoredAuthors": [

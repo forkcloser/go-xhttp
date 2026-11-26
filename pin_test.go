@@ -54,7 +54,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/forkcloser/xhttp"
+	"github.com/forkcloser/go-xhttp"
 )
 
 // device makes the certificate of a server no authority vouches for and no

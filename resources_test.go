@@ -22,7 +22,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/forkcloser/xhttp"
+	"github.com/forkcloser/go-xhttp"
 )
 
 // errUnexpected is the error of a step of a test that did not go as planned.

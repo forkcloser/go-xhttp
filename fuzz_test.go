@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/forkcloser/xhttp"
+	"github.com/forkcloser/go-xhttp"
 )
 
 // FuzzCredentialHost: a host is either refused when the credential is made,
