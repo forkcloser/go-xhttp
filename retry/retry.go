@@ -16,15 +16,6 @@ import (
 	"github.com/forkcloser/xhttp"
 )
 
-const (
-	// DefaultBackoff is the wait before the first retry under Options that
-	// name no Backoff.
-	DefaultBackoff = 500 * time.Millisecond
-	// DefaultMaxBackoff is the longest wait before a retry under Options
-	// that name no MaxBackoff.
-	DefaultMaxBackoff = 30 * time.Second
-)
-
 // drainLimit is how much of a response given up on is read before it is
 // closed, so that its connection carries the retry. The body is the server's
 // to size: past the limit the connection is given up with it.
