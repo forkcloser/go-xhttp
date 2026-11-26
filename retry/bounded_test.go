@@ -22,8 +22,10 @@ import (
 func TestMethods(t *testing.T) {
 	t.Parallel()
 
+	// A request with no method is a GET (net/http, Request.Method: "For
+	// client requests, an empty string means GET").
 	idempotent := []string{
-		http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace, http.MethodPut, http.MethodDelete,
+		http.MethodGet, http.MethodHead, http.MethodOptions, http.MethodTrace, http.MethodPut, http.MethodDelete, "",
 	}
 
 	keys := map[string]func(*http.Request){
@@ -44,7 +46,14 @@ func TestMethods(t *testing.T) {
 			} {
 				base := &scripted{script: failing(1, failure)}
 
-				_, _ = send(t, base, quick(1), method, key)
+				// As written: http.NewRequest fills an empty method in.
+				_, _ = send(t, base, quick(1), method, func(req *http.Request) {
+					req.Method = method
+
+					if key != nil {
+						key(req)
+					}
+				})
 
 				if want := map[bool]int{true: 2, false: 1}[again]; len(base.attempts()) != want {
 					t.Errorf(

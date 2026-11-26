@@ -461,7 +461,13 @@ func TestABodyIsSentAgainWhole(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req.GetBody = func() (io.ReadCloser, error) { return nil, errBodyGone }
+	var asked int
+
+	req.GetBody = func() (io.ReadCloser, error) {
+		asked++
+
+		return nil, errBodyGone
+	}
 
 	resp, err := retry.NewTransport(base, quick(3)).RoundTrip(req)
 	if err != nil || resp.StatusCode != http.StatusServiceUnavailable || len(base.attempts()) != 1 {
@@ -471,6 +477,10 @@ func TestABodyIsSentAgainWhole(t *testing.T) {
 			err,
 			len(base.attempts()),
 		)
+	}
+
+	if asked != 1 {
+		t.Errorf("a GetBody that fails was asked %d times, want once: the answer in hand is kept", asked)
 	}
 
 	content, err := io.ReadAll(resp.Body)
@@ -545,6 +555,25 @@ func TestWhatNoAttemptChangesIsNotRetried(t *testing.T) {
 				t.Errorf("%v after %d attempts; want its own error after 1", err, base.count.Load())
 			}
 		})
+	}
+}
+
+// TestALookupThatMayPassIsTriedAgain: of the errors of a lookup, only the
+// one that says the host does not exist ends the attempts.
+func TestALookupThatMayPassIsTriedAgain(t *testing.T) {
+	t.Parallel()
+
+	for what, lookup := range map[string]*net.DNSError{
+		"a lookup that timed out":          {Err: "i/o timeout", Name: "server.test", IsTimeout: true},
+		"a server that could not answer":   {Err: "server misbehaving", Name: "server.test", IsTemporary: true},
+		"an error the resolver calls none": {Err: "lookup failed", Name: "server.test"},
+	} {
+		base := &scripted{script: failing(1, answer{err: lookup})}
+
+		if status, err := send(t, base, quick(1), http.MethodGet, nil); err != nil || status != http.StatusOK ||
+			len(base.attempts()) != 2 {
+			t.Errorf("%s: %d, %v after %d attempts; want 200 after 2", what, status, err, len(base.attempts()))
+		}
 	}
 }
 
