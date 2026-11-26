@@ -25,23 +25,27 @@ const (
 // Options is what varies between retrying transports. The zero value sends
 // each request once.
 type Options struct {
-	// Retries is how many times at most a request is sent again. Zero or
-	// less sends each request once.
+	// Retries is how many times at most a request is sent again. Zero
+	// sends each request once.
 	Retries int
-	// Backoff is the wait before the first retry. Zero or less is half a
-	// second.
+	// Backoff is the wait before the first retry. Zero is half a second.
 	Backoff time.Duration
 	// MaxBackoff is the longest wait before a retry, and the longest
-	// Retry-After obeyed. Zero or less is 30 seconds.
+	// Retry-After obeyed. Zero is 30 seconds.
 	MaxBackoff time.Duration
 }
 
 // NewTransport returns a transport that carries each request through base,
 // and again as the package doc says. Its CloseIdleConnections forwards to
-// base. It panics on a nil base.
+// base. It panics on a nil base, and on Options with a negative field: a
+// count or a wait below zero has no meaning to give.
 func NewTransport(base http.RoundTripper, options Options) http.RoundTripper {
 	if base == nil {
 		panic("retry: NewTransport needs a transport to carry the attempts")
+	}
+
+	if options.Retries < 0 || options.Backoff < 0 || options.MaxBackoff < 0 {
+		panic(fmt.Sprintf("retry: NewTransport needs Options with no negative field, and was given %+v", options))
 	}
 
 	made := &transport{
@@ -51,11 +55,11 @@ func NewTransport(base http.RoundTripper, options Options) http.RoundTripper {
 		maxBackoff: options.MaxBackoff,
 	}
 
-	if made.backoff <= 0 {
+	if made.backoff == 0 {
 		made.backoff = defaultBackoff
 	}
 
-	if made.maxBackoff <= 0 {
+	if made.maxBackoff == 0 {
 		made.maxBackoff = defaultMaxBackoff
 	}
 

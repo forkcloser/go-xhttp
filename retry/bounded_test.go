@@ -391,6 +391,16 @@ func TestBackoffAtTheEdges(t *testing.T) {
 	drawn(t, "the largest MaxBackoff, retry 1", before(t, waited, 1), 15*time.Millisecond, 25*time.Millisecond)
 	drawn(t, "the largest MaxBackoff, retry 2", before(t, waited, 2), 30*time.Millisecond, 50*time.Millisecond)
 
+	// A nanosecond is a wait, and not the zero that stands for a default.
+	for name, options := range map[string]retry.Options{
+		"a Backoff of a nanosecond":    {Retries: 1, Backoff: 1, MaxBackoff: time.Hour},
+		"a MaxBackoff of a nanosecond": {Retries: 1, Backoff: time.Hour, MaxBackoff: 1},
+	} {
+		if smallest := clocked(t, 1, options, failing(1, answer{err: errFlaky})); smallest[0][0] > 1 {
+			t.Errorf("%s: waited %v", name, smallest[0][0])
+		}
+	}
+
 	// A millisecond doubled 79 times is past what a duration holds, and
 	// past it twice over.
 	const doublings = 80

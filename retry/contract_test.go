@@ -38,7 +38,8 @@ package retry_test
 //     a trailer the caller sets while the body is read is sent with each
 //     attempt;
 //   - a retry is a debug record with the method and the host, and no path;
-//   - the zero Options sends each request once; a nil base panics.
+//   - the zero Options sends each request once; a nil base panics, and so
+//     does a negative Retries, Backoff or MaxBackoff.
 
 import (
 	"context"
@@ -47,6 +48,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -853,14 +855,51 @@ func TestTheZeroOptionsSendOnce(t *testing.T) {
 	t.Parallel()
 
 	for name, options := range map[string]retry.Options{
-		"the zero Options":   {},
-		"a negative Retries": {Retries: -1, Backoff: time.Millisecond},
+		"the zero Options":       {},
+		"no Retries, and a wait": {Backoff: time.Millisecond, MaxBackoff: time.Millisecond},
 	} {
 		base := &scripted{script: failing(2, answer{status: http.StatusServiceUnavailable})}
 
 		status, err := send(t, base, options, http.MethodGet, nil)
 		if err != nil || status != http.StatusServiceUnavailable || len(base.attempts()) != 1 {
 			t.Errorf("%s: %d, %v after %d attempts; want the 503 after 1", name, status, err, len(base.attempts()))
+		}
+	}
+}
+
+// TestNewTransportRefusesANegativeOption: a count or a wait below zero is
+// refused when the transport is made, and the smallest of each that is not
+// is taken.
+func TestNewTransportRefusesANegativeOption(t *testing.T) {
+	t.Parallel()
+
+	panics := func(options retry.Options) (panicked bool) {
+		defer func() { panicked = recover() != nil }()
+
+		retry.NewTransport(&scripted{}, options)
+
+		return false
+	}
+
+	for name, options := range map[string]retry.Options{
+		"a negative Retries":        {Retries: -1},
+		"a negative Backoff":        {Retries: 1, Backoff: -1},
+		"a negative MaxBackoff":     {Retries: 1, MaxBackoff: -1},
+		"the most negative Retries": {Retries: math.MinInt},
+		"the most negative Backoff": {Backoff: math.MinInt64},
+	} {
+		if !panics(options) {
+			t.Errorf("%s: NewTransport did not panic", name)
+		}
+	}
+
+	for name, options := range map[string]retry.Options{
+		"zeros":                     {},
+		"a nanosecond of each wait": {Retries: 1, Backoff: 1, MaxBackoff: 1},
+		"the largest of each":       {Retries: math.MaxInt, Backoff: math.MaxInt64, MaxBackoff: math.MaxInt64},
+	} {
+		if panics(options) {
+			t.Errorf("%s: NewTransport panicked", name)
 		}
 	}
 }
