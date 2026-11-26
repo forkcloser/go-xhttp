@@ -59,14 +59,14 @@ func TestMethods(t *testing.T) {
 	}
 }
 
-// TestStatuses: of every status, the five that say the server could not
+// TestStatuses: of every status, the six that say the server could not
 // answer now are asked again.
 func TestStatuses(t *testing.T) {
 	t.Parallel()
 
 	again := []int{
-		http.StatusTooManyRequests, http.StatusInternalServerError, http.StatusBadGateway,
-		http.StatusServiceUnavailable, http.StatusGatewayTimeout,
+		http.StatusRequestTimeout, http.StatusTooManyRequests, http.StatusInternalServerError,
+		http.StatusBadGateway, http.StatusServiceUnavailable, http.StatusGatewayTimeout,
 	}
 
 	for status := 100; status <= 599; status++ {

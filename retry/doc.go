@@ -6,9 +6,9 @@
 //
 // # What is sent again
 //
-// A request whose attempt failed, or was answered 429, 500, 502, 503 or 504,
-// when sending it twice does what sending it once does: its method is GET,
-// HEAD, OPTIONS, TRACE, PUT or DELETE, the idempotent methods of RFC 9110
+// A request whose attempt failed, or was answered 408, 429, 500, 502, 503 or
+// 504, when sending it twice does what sending it once does: its method is
+// GET, HEAD, OPTIONS, TRACE, PUT or DELETE, the idempotent methods of RFC 9110
 // section 9.2.2, or it carries an Idempotency-Key or X-Idempotency-Key header,
 // whatever its value, as net/http reads it. Any other request is sent again
 // only when no connection could be made, since nothing was sent.

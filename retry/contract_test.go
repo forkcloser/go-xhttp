@@ -5,7 +5,8 @@ package retry_test
 // 9110 for the idempotent methods (section 9.2.2) and Retry-After (section
 // 10.2.3):
 //   - a request is sent again, Retries times at most, when its attempt
-//     failed or was answered 429, 500, 502, 503 or 504, and it is idempotent:
+//     failed or was answered 408 (RFC 9110, 15.5.9: the client "MAY repeat
+//     that request"), 429, 500, 502, 503 or 504, and it is idempotent:
 //     GET, HEAD, OPTIONS, TRACE, PUT, DELETE, or any method with an
 //     Idempotency-Key or X-Idempotency-Key header, whatever its value;
 //   - any other request is sent once, unless no connection could be made;

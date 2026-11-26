@@ -35,12 +35,12 @@ sentinel to test before naming a weaker level for that server.
 ## Retries
 
 `retry.NewTransport` wraps any `http.RoundTripper`. It sends a request again
-after a failure or a 429, 500, 502, 503 or 504, when the request is idempotent
-(GET, HEAD, OPTIONS, TRACE, PUT, DELETE, or one with an `Idempotency-Key`) and
-its body can be read again. It waits with a doubling, jittered backoff, obeys
-`Retry-After` up to `Options.MaxBackoff`, and returns the last attempt's
-response whatever its status: the status is the caller's to read, as with any
-`http.RoundTripper`.
+after a failure or a 408, 429, 500, 502, 503 or 504, when the request is
+idempotent (GET, HEAD, OPTIONS, TRACE, PUT, DELETE, or one with an
+`Idempotency-Key`) and its body can be read again. It waits with a doubling,
+jittered backoff, obeys `Retry-After` up to `Options.MaxBackoff`, and returns
+the last attempt's response whatever its status: the status is the caller's
+to read, as with any `http.RoundTripper`.
 
 The package docs hold the whole contract: `go doc github.com/forkcloser/xhttp`
 and `go doc github.com/forkcloser/xhttp/retry`.
