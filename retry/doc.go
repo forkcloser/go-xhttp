@@ -17,6 +17,12 @@
 // http.NewRequest sets for a body in memory. One whose body is a stream is
 // sent once.
 //
+// The same section of RFC 9110 ends: "A client SHOULD NOT automatically retry
+// a failed automatic retry." With [Options.Retries] above one this package
+// does, on purpose, as a backoff presumes; and net/http's own transport may
+// already have sent a request twice under it, when a connection it reused
+// turned out closed.
+//
 // # What is not
 //
 // A failure no further attempt changes: the request's context is done; the
