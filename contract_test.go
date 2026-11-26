@@ -75,6 +75,8 @@ package xhttp_test
 //   - a transport is safe for concurrent use (net/http: "A RoundTripper must
 //     be safe for concurrent use by multiple goroutines").
 //
+// The pin's part of it is at the top of pin_test.go.
+//
 import (
 	"bufio"
 	"context"
@@ -477,6 +479,7 @@ func TestAnUntrustedServerIsTheStandardLibrarysError(t *testing.T) {
 
 	for _, sentinel := range []error{
 		xhttp.ErrOffline, xhttp.ErrCleartext, xhttp.ErrHandshakeRefused, xhttp.ErrStalled, xhttp.ErrRedirect,
+		xhttp.ErrCredential, xhttp.ErrPin, xhttp.ErrPinMismatch,
 	} {
 		if errors.Is(err, sentinel) {
 			t.Errorf("a certificate verification error matches %v", sentinel)

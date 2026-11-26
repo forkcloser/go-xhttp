@@ -22,6 +22,7 @@ client.Transport = retry.NewTransport(client.Transport, retry.Options{Retries: 3
 |---|---|---|
 | Scheme | https only, `ErrCleartext` otherwise | `Config.Cleartext` |
 | Proxy | the environment's; credentials for it over https only, `ErrCleartext` otherwise | `Config.Proxy`, `Config.Cleartext` |
+| Trust | the system's roots | `Config.Roots`; or `Config.Pin`, one server by its certificate's fingerprint and no other host, `ErrPinMismatch` otherwise |
 | TLS | `HybridOnly`: TLS 1.3, post-quantum hybrid key exchanges only | `Config.TLS`: `Classical`, `Legacy`, for the whole transport |
 | Silent server | a request the server stops taking for a minute, a response that has not begun a minute after the request was sent, or a read of its body that waits a minute for a byte, fails with `ErrStalled` | `Config.StallTimeout`, negative to wait for ever |
 | Redirects | none from https to anything else, under any client; at most 10 under `NewClient` | a client of your own, for another limit |
@@ -33,6 +34,30 @@ program that reaches hosts at two levels makes two transports. A TLS
 handshake that fails for another reason than the server's certificate or the
 network is `ErrHandshakeRefused`, the one sentinel to test before naming a
 weaker level for that server.
+
+## One server, by its certificate
+
+A server no authority vouches for, a device with a certificate of its own
+making, is trusted by the fingerprint of that certificate and by nothing
+else:
+
+```go
+pin, err := xhttp.NewPin("192.0.2.10:8443", fingerprint)
+if err != nil {
+	return err
+}
+
+client := xhttp.NewClient(xhttp.Config{Pin: pin})
+```
+
+The fingerprint is the SHA-256 of the certificate the server presents, as 64
+hexadecimal digits or as `openssl x509 -noout -fingerprint -sha256` prints
+it. Who signed the certificate, the name it bears and its dates are not
+consulted. A transport that has a pin is that server's alone: a request for
+another host or another port is not sent, it takes no proxy, and a server
+that presents another certificate is `ErrPinMismatch`, which holds the
+fingerprint presented. A certificate that is renewed is another certificate,
+and another pin.
 
 ## Retries
 

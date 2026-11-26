@@ -15,6 +15,13 @@ type Config struct {
 	TLS TLSLevel
 	// Roots is the certificate authorities trusted; the system's when nil.
 	Roots *x509.CertPool
+	// Pin, when it is not the zero Pin, makes the transport one server's:
+	// it trusts that server by the fingerprint of its certificate, in place
+	// of any authority, and fails a request for any other host with
+	// [ErrPinMismatch]. Such a transport takes no proxy, the environment's
+	// included, and NewTransport panics when Roots, Proxy or Cleartext is
+	// set too.
+	Pin Pin
 	// Proxy picks a request's proxy; http.ProxyFromEnvironment when nil,
 	// which net/http reads once for the process. A proxy whose URL holds
 	// credentials is reached over https only, or the request fails with

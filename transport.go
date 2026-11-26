@@ -39,6 +39,7 @@ const (
 
 type transport struct {
 	base      *http.Transport
+	pin       Pin
 	stall     time.Duration // zero: the server's silence is never an error
 	userAgent string
 	cleartext bool
@@ -47,8 +48,17 @@ type transport struct {
 
 // NewTransport returns a transport under config, with a connection pool of
 // its own. Its CloseIdleConnections is the one http.Client calls. It panics
-// on a TLSLevel there is none of.
+// on a TLSLevel there is none of, and on a Pin given with Roots, a Proxy or
+// Cleartext.
 func NewTransport(config Config) http.RoundTripper {
+	// A Config that says both is the program's mistake: roots would not be
+	// consulted, a proxy is another server than the pinned one, and a
+	// cleartext connection has no certificate to hold to the pin.
+	if config.Pin.set && (config.Roots != nil || config.Proxy != nil || config.Cleartext) {
+		panic("xhttp: a transport with a Pin consults no roots, takes no proxy and sends nothing in cleartext: " +
+			"Config.Roots, Config.Proxy and Config.Cleartext must be unset")
+	}
+
 	stall := config.StallTimeout
 	if stall == 0 {
 		stall = stallTimeout
@@ -76,6 +86,7 @@ func NewTransport(config Config) http.RoundTripper {
 			MaxConnsPerHost:       maxConnsPerHost,
 			HTTP2:                 &http.HTTP2Config{SendPingTimeout: pingAfter, PingTimeout: pingTimeout},
 		},
+		pin:       config.Pin,
 		stall:     max(stall, 0),
 		userAgent: config.UserAgent,
 		cleartext: config.Cleartext,
@@ -87,6 +98,12 @@ func NewTransport(config Config) http.RoundTripper {
 // given credentials to send in cleartext: net/http sends those of an http
 // proxy as a header, and those of a SOCKS5 proxy as they are.
 func proxyOf(config Config) func(*http.Request) (*url.URL, error) {
+	// A pinned transport dials its server and nothing else: the one TLS
+	// configuration it has would hold an https proxy to the server's pin.
+	if config.Pin.set {
+		return nil
+	}
+
 	pick := config.Proxy
 	if pick == nil {
 		pick = http.ProxyFromEnvironment
@@ -109,6 +126,13 @@ func proxyOf(config Config) func(*http.Request) (*url.URL, error) {
 func tlsConfig(config Config) *tls.Config {
 	// #nosec G402 -- Legacy is Go's own floor, and a transport gets it only by name
 	made := &tls.Config{RootCAs: config.Roots}
+
+	if config.Pin.set {
+		// The pin is what verifies, in place of the chain, the name and the
+		// dates: crypto/tls calls VerifyConnection whatever this is set to.
+		made.InsecureSkipVerify = true // #nosec G402 -- VerifyConnection holds every handshake to the pin
+		made.VerifyConnection = config.Pin.verify
+	}
 
 	switch config.TLS {
 	case HybridOnly:
@@ -148,6 +172,12 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		closeBody(req)
 
 		return nil, fmt.Errorf("%w: %s://%s", ErrCleartext, req.URL.Scheme, req.URL.Host)
+	}
+
+	if t.pin.set && !t.pin.host.is(req.URL) {
+		closeBody(req)
+
+		return nil, fmt.Errorf("%w: %s was asked of a transport pinned to %s", ErrPinMismatch, req.URL.Host, t.pin.host)
 	}
 
 	// A wait for the server is cut short by cancelling the request, which
@@ -282,7 +312,7 @@ func (h *handshakes) refused(err error) error {
 	// makes for a request may fail while the request travels on another,
 	// and ends in an error that is not the handshake's. No error has the
 	// nil of a handshake that worked in its chain.
-	if errors.Is(err, h.last) && !untrusted(h.last) && !ofTheNetwork(h.last) {
+	if errors.Is(err, h.last) && !untrusted(h.last) && !ofTheNetwork(h.last) && !errors.Is(h.last, ErrPinMismatch) {
 		return fmt.Errorf("%w: %w", ErrHandshakeRefused, err)
 	}
 

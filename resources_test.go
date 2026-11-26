@@ -7,6 +7,7 @@ package xhttp_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
@@ -216,6 +217,10 @@ func TestEveryWayOutLetsGoOfTheRequest(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	toAnother := xhttp.NewTransport(xhttp.Config{
+		Pin: pinned(t, strings.TrimPrefix(untrusted.URL, "https://"), strings.Repeat("ab", sha256.Size)),
+	})
+
 	one := xhttp.NewTransport(xhttp.Config{Cleartext: true, StallTimeout: stall})
 	second := xhttp.NewTransport(xhttp.Config{Roots: trusted, StallTimeout: stall})
 
@@ -256,6 +261,8 @@ func TestEveryWayOutLetsGoOfTheRequest(t *testing.T) {
 		{"a certificate that is not trusted", xhttp.NewTransport(xhttp.Config{}), untrusted.URL, nil},
 		{"offline", xhttp.NewTransport(xhttp.Config{Offline: true}), "https://server.test/", nil},
 		{"cleartext refused", xhttp.NewTransport(xhttp.Config{}), "http://server.test/", nil},
+		{"a certificate that is not the pinned one", toAnother, untrusted.URL, nil},
+		{"a host that is not the pinned one", toAnother, "https://server.test/", nil},
 	} {
 		parent := counting()
 
