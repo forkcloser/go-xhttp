@@ -239,10 +239,15 @@ func (c Credential) led(req *http.Request) bool {
 	return true
 }
 
-// covers reports whether target's host is one the credential is for. The
-// standard library dials a name that is ASCII as the URL writes it, and
-// another by a conversion this package does not have: only ASCII matches.
+// covers reports whether target's host is one the credential is for.
 func (c Credential) covers(target *url.URL) bool {
+	return slices.ContainsFunc(c.hosts, func(named host) bool { return named.is(target) })
+}
+
+// is reports whether target's host and port are h's. The standard library
+// dials a name that is ASCII as the URL writes it, and another by a
+// conversion this package does not have: only ASCII matches.
+func (h host) is(target *url.URL) bool {
 	port := httpsPort
 
 	if written := target.Port(); written != "" {
@@ -254,20 +259,18 @@ func (c Credential) covers(target *url.URL) bool {
 		port = uint16(number)
 	}
 
-	name := target.Hostname()
-	addr, err := netip.ParseAddr(name)
-	isAddr := err == nil
+	if h.port != port {
+		return false
+	}
 
-	return slices.ContainsFunc(c.hosts, func(named host) bool {
-		switch {
-		case named.port != port:
-			return false
-		case named.addr.IsValid():
-			return isAddr && named.addr == addr
-		default:
-			return !isAddr && named.name == lowerASCII(name)
-		}
-	})
+	name := target.Hostname()
+
+	addr, err := netip.ParseAddr(name)
+	if h.addr.IsValid() {
+		return err == nil && h.addr == addr
+	}
+
+	return err != nil && h.name == lowerASCII(name)
 }
 
 // parseHost reads one host of a credential.
