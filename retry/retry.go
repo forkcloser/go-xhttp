@@ -280,9 +280,20 @@ func unavailable(status int) bool {
 // unsent reports an error that came before anything was sent: the connection
 // could not be made.
 func unsent(err error) bool {
-	opErr, ok := errors.AsType[*net.OpError](err)
+	// Every OpError of the chain: through a proxy the dial's error is
+	// inside another, whose Op is "proxyconnect".
+	for {
+		opErr, ok := errors.AsType[*net.OpError](err)
 
-	return ok && opErr.Op == "dial"
+		switch {
+		case !ok:
+			return false
+		case opErr.Op == "dial":
+			return true
+		}
+
+		err = opErr.Err
+	}
 }
 
 // permanent reports an error no further attempt changes.

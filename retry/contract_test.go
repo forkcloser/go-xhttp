@@ -42,6 +42,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -308,7 +309,8 @@ func TestARequestThatIsNotIdempotentIsSentOnce(t *testing.T) {
 }
 
 // TestNoConnectionIsNothingSent: a request that is not idempotent is sent
-// again when the connection could not be made.
+// again when the connection could not be made, to the server or to the
+// proxy before it.
 func TestNoConnectionIsNothingSent(t *testing.T) {
 	t.Parallel()
 
@@ -324,26 +326,75 @@ func TestNoConnectionIsNothingSent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const retries = 2
-
-	base := &counting{base: xhttp.NewTransport(xhttp.Config{Cleartext: true})}
-
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, address, strings.NewReader("content"))
+	nowhere, err := url.Parse(address)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	resp, err := retry.NewTransport(base, quick(retries)).RoundTrip(req)
-	if resp != nil {
-		_ = resp.Body.Close()
-	}
+	const retries = 2
 
-	if refused, found := errors.AsType[*net.OpError](err); !found || refused.Op != "dial" {
-		t.Fatalf("a request to a closed port = %v, want the dial's error", err)
-	}
+	for what, sent := range map[string]struct {
+		config  xhttp.Config
+		address string
+		op      string
+	}{
+		"a closed port":                   {xhttp.Config{Cleartext: true}, address, "dial"},
+		"a proxy on a closed port":        {xhttp.Config{Cleartext: true, Proxy: http.ProxyURL(nowhere)}, "http://server.test/", "proxyconnect"},
+		"https, a proxy on a closed port": {xhttp.Config{Cleartext: true, Proxy: http.ProxyURL(nowhere)}, "https://server.test/", "proxyconnect"},
+	} {
+		base := &counting{base: xhttp.NewTransport(sent.config)}
 
-	if base.count.Load() != retries+1 {
-		t.Errorf("a POST no connection carried was attempted %d times, want %d", base.count.Load(), retries+1)
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, sent.address, strings.NewReader("content"))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		resp, err := retry.NewTransport(base, quick(retries)).RoundTrip(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+
+		// The first OpError of the chain is the one net/http made.
+		if refused, found := errors.AsType[*net.OpError](err); !found || refused.Op != sent.op {
+			t.Fatalf("%s: %v, want a %s error", what, err, sent.op)
+		}
+
+		if base.count.Load() != retries+1 {
+			t.Errorf("%s: a POST no connection carried was attempted %d times, want %d",
+				what, base.count.Load(), retries+1)
+		}
+	}
+}
+
+// TestWhatCountsAsNoConnection: a dial's error anywhere under the errors
+// net wraps it in, and no other error of the network.
+func TestWhatCountsAsNoConnection(t *testing.T) {
+	t.Parallel()
+
+	dial := &net.OpError{Op: "dial", Net: "tcp", Err: errFlaky}
+
+	const retries = 2
+
+	for what, failure := range map[string]struct {
+		err      error
+		attempts int
+	}{
+		"a dial":                       {dial, retries + 1},
+		"a dial under a proxy's error": {&net.OpError{Op: "proxyconnect", Net: "tcp", Err: dial}, retries + 1},
+		"the same, wrapped in between": {&net.OpError{Op: "proxyconnect", Err: fmt.Errorf("%w: wrapped", dial)}, retries + 1},
+		"a read":                       {&net.OpError{Op: "read", Net: "tcp", Err: errFlaky}, 1},
+		"a read under a proxy's error": {&net.OpError{Op: "proxyconnect", Err: &net.OpError{Op: "read", Err: errFlaky}}, 1},
+		"a proxy's error with no dial": {&net.OpError{Op: "proxyconnect", Net: "tcp", Err: errFlaky}, 1},
+		"an error that is not net's":   {errFlaky, 1},
+		"a write":                      {&net.OpError{Op: "write", Net: "tcp", Err: errFlaky}, 1},
+		"a dial under a read":          {&net.OpError{Op: "read", Net: "tcp", Err: dial}, retries + 1},
+	} {
+		base := &scripted{script: failing(retries+1, answer{err: failure.err})}
+
+		if _, err := send(t, base, quick(retries), http.MethodPost, nil); !errors.Is(err, failure.err) ||
+			len(base.attempts()) != failure.attempts {
+			t.Errorf("%s: %v after %d attempts, want %d", what, err, len(base.attempts()), failure.attempts)
+		}
 	}
 }
 
