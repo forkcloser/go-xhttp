@@ -228,7 +228,7 @@ func TestARefusedRequestHasItsBodyClosed(t *testing.T) {
 func TestUnknownLevelPanics(t *testing.T) {
 	t.Parallel()
 
-	for _, level := range []xhttp.KeyExchange{-1, xhttp.Legacy + 1} {
+	for _, level := range []xhttp.TLSLevel{-1, xhttp.Legacy + 1} {
 		for name, build := range map[string]func(xhttp.Config){
 			"NewTransport": func(config xhttp.Config) { xhttp.NewTransport(config) },
 			"NewClient":    func(config xhttp.Config) { xhttp.NewClient(config) },
@@ -240,7 +240,7 @@ func TestUnknownLevelPanics(t *testing.T) {
 					}
 				}()
 
-				build(xhttp.Config{KeyExchange: level})
+				build(xhttp.Config{TLS: level})
 			}()
 		}
 	}
@@ -402,7 +402,7 @@ func TestWhatARefusedHandshakeIs(t *testing.T) {
 			t.Context(), answeringInTLS12(t), xhttp.Config{}, true,
 		},
 		"a server that answers in TLS 1.2, at Classical": {
-			t.Context(), answeringInTLS12(t), xhttp.Config{KeyExchange: xhttp.Classical}, true,
+			t.Context(), answeringInTLS12(t), xhttp.Config{TLS: xhttp.Classical}, true,
 		},
 		"a server that does not speak TLS": {
 			t.Context(), "https://" + strings.TrimPrefix(plain.URL, "http://"), xhttp.Config{}, true,

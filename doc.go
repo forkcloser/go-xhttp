@@ -40,7 +40,7 @@
 //   - [ErrHandshakeRefused]: the TLS handshake failed, and neither the
 //     server's certificate nor the network is the cause. Most often the
 //     server has nothing the transport's level accepts, which no retry
-//     changes and a weaker [KeyExchange] may.
+//     changes and a weaker [TLSLevel] may.
 //   - [ErrStalled]: the server went silent, in the middle of the request,
 //     before its response, or in the middle of its body. What was read of a
 //     body is the caller's, and so is asking for the rest.

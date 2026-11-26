@@ -11,8 +11,8 @@ import (
 // Config is what varies between transports. The zero value is the baseline:
 // https only, HybridOnly, the system's roots, the environment's proxy.
 type Config struct {
-	// KeyExchange is the level of every connection the transport makes.
-	KeyExchange KeyExchange
+	// TLS is the level of every connection the transport makes.
+	TLS TLSLevel
 	// Roots is the certificate authorities trusted; the system's when nil.
 	Roots *x509.CertPool
 	// Proxy picks a request's proxy; http.ProxyFromEnvironment when nil.

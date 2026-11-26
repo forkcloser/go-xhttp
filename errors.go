@@ -11,7 +11,8 @@ var (
 	// ErrHandshakeRefused is the error of a TLS handshake that failed, when
 	// neither the server's certificate nor the network is the cause: most
 	// often a server that offers no key exchange, or no TLS version, the
-	// transport's level accepts, whichever side ends the handshake over it.
+	// transport's [TLSLevel] accepts, whichever side ends the handshake over
+	// it.
 	// A failure of the server's own in the middle of a handshake is in it
 	// too, and may pass at another attempt: nothing tells the two apart.
 	// What a server says once the handshake is done is not in it.

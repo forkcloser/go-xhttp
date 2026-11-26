@@ -25,12 +25,12 @@ import (
 	"github.com/forkcloser/xhttp"
 )
 
-// TestKeyExchangeLevels: each server is reached by the levels that accept
+// TestTLSLevels: each server is reached by the levels that accept
 // what it offers, and refused by the stricter ones.
-func TestKeyExchangeLevels(t *testing.T) {
+func TestTLSLevels(t *testing.T) {
 	t.Parallel()
 
-	everyLevel := []xhttp.KeyExchange{xhttp.HybridOnly, xhttp.Classical, xhttp.Legacy}
+	everyLevel := []xhttp.TLSLevel{xhttp.HybridOnly, xhttp.Classical, xhttp.Legacy}
 
 	only := func(curve tls.CurveID) func(*tls.Config) {
 		return func(config *tls.Config) { config.CurvePreferences = []tls.CurveID{curve} }
@@ -38,7 +38,7 @@ func TestKeyExchangeLevels(t *testing.T) {
 
 	for name, offer := range map[string]struct {
 		configure func(*tls.Config)
-		reached   []xhttp.KeyExchange
+		reached   []xhttp.TLSLevel
 	}{
 		"Go's own offer":           {nil, everyLevel},
 		"X25519MLKEM768 alone":     {only(tls.X25519MLKEM768), everyLevel},
@@ -54,7 +54,7 @@ func TestKeyExchangeLevels(t *testing.T) {
 			server, roots := secure(t, ok, offer.configure)
 
 			for _, level := range everyLevel {
-				client := xhttp.NewClient(xhttp.Config{Roots: roots, KeyExchange: level})
+				client := xhttp.NewClient(xhttp.Config{Roots: roots, TLS: level})
 
 				status, err := get(t.Context(), t, client, server.URL)
 

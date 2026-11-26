@@ -46,7 +46,7 @@ type transport struct {
 
 // NewTransport returns a transport under config, with a connection pool of
 // its own. Its CloseIdleConnections is the one http.Client calls. It panics
-// on a KeyExchange there is none of.
+// on a TLSLevel there is none of.
 func NewTransport(config Config) http.RoundTripper {
 	proxy := config.Proxy
 	if proxy == nil {
@@ -83,7 +83,7 @@ func tlsConfig(config Config) *tls.Config {
 	// #nosec G402 -- Legacy is Go's own floor, and a transport gets it only by name
 	made := &tls.Config{RootCAs: config.Roots}
 
-	switch config.KeyExchange {
+	switch config.TLS {
 	case HybridOnly:
 		made.MinVersion = tls.VersionTLS13
 		made.CurvePreferences = []tls.CurveID{tls.X25519MLKEM768, tls.SecP256r1MLKEM768, tls.SecP384r1MLKEM1024}
@@ -91,7 +91,7 @@ func tlsConfig(config Config) *tls.Config {
 		made.MinVersion = tls.VersionTLS13
 	case Legacy:
 	default:
-		panic(fmt.Sprintf("xhttp: there is no key exchange level %d", config.KeyExchange))
+		panic(fmt.Sprintf("xhttp: there is no TLS level %d", config.TLS))
 	}
 
 	return made
