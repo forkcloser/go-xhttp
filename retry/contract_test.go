@@ -70,8 +70,8 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/forkcloser/xhttp"
-	"github.com/forkcloser/xhttp/retry"
+	"github.com/forkcloser/go-xhttp"
+	"github.com/forkcloser/go-xhttp/retry"
 )
 
 var (

@@ -21,7 +21,7 @@ import (
 	"testing"
 	"unicode"
 
-	"github.com/forkcloser/xhttp"
+	"github.com/forkcloser/go-xhttp"
 )
 
 // TestTLSLevels: each server is reached by the levels that accept

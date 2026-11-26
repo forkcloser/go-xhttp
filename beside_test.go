@@ -19,7 +19,7 @@ import (
 	"testing"
 	"testing/iotest"
 
-	"github.com/forkcloser/xhttp"
+	"github.com/forkcloser/go-xhttp"
 )
 
 var (

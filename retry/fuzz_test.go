@@ -8,7 +8,7 @@ import (
 	"testing/synctest"
 	"time"
 
-	"github.com/forkcloser/xhttp/retry"
+	"github.com/forkcloser/go-xhttp/retry"
 )
 
 // owed is what a Retry-After asks for, read as RFC 9110 section 10.2.3
