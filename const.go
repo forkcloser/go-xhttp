@@ -1,15 +1,5 @@
 package xhttp
 
-import "time"
-
-const (
-	// DefaultStallTimeout is how long a read of a response body waits for a
-	// byte under a Config that names no StallTimeout.
-	DefaultStallTimeout = time.Minute
-	// DefaultRedirects is how many redirects a client from NewClient follows.
-	DefaultRedirects = 10
-)
-
 // KeyExchange is what a transport's connections may agree their keys with,
 // and under which TLS versions. The zero value is the strictest, and each one
 // after it gives something up.

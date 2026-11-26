@@ -21,8 +21,8 @@ type Config struct {
 	// Proxy picks a request's proxy; http.ProxyFromEnvironment when nil.
 	Proxy func(*http.Request) (*url.URL, error)
 	// StallTimeout is how long a read of a response body may wait for a
-	// byte before it fails with [ErrStalled]. Zero is DefaultStallTimeout;
-	// a negative value waits for ever.
+	// byte before it fails with [ErrStalled]. Zero is one minute; a
+	// negative value waits for ever.
 	StallTimeout time.Duration
 	// UserAgent is the User-Agent of a request that has no such header;
 	// Go's own when empty.
@@ -36,12 +36,14 @@ type Config struct {
 }
 
 // NewClient returns a client on a transport under config, which follows
-// redirects as [Redirects] does, DefaultRedirects of them. It panics as
-// [NewTransport] does.
+// redirects as [Redirects] does, ten of them. It panics as [NewTransport]
+// does.
 func NewClient(config Config) *http.Client {
+	const redirects = 10
+
 	return &http.Client{
 		Transport:     NewTransport(config),
-		CheckRedirect: Redirects(DefaultRedirects),
+		CheckRedirect: Redirects(redirects),
 	}
 }
 

@@ -266,7 +266,10 @@ func TestRedirectLimit(t *testing.T) {
 
 	transport := xhttp.NewTransport(xhttp.Config{Roots: roots})
 
-	for _, limit := range []int{-1, 0, 1, xhttp.DefaultRedirects} {
+	// ten is what a client from NewClient follows, by its docs.
+	const ten = 10
+
+	for _, limit := range []int{-1, 0, 1, ten} {
 		client := &http.Client{Transport: transport, CheckRedirect: xhttp.Redirects(limit)}
 
 		for hops := range max(limit, 0) + 2 {
@@ -285,12 +288,15 @@ func TestRedirectLimit(t *testing.T) {
 
 	byDefault := xhttp.NewClient(xhttp.Config{Roots: roots})
 
-	atLimit := server.URL + "/?left=" + strconv.Itoa(xhttp.DefaultRedirects)
+	atLimit := server.URL + "/?left=" + strconv.Itoa(ten)
 	if status, err := get(t.Context(), t, byDefault, atLimit); err != nil || status != http.StatusOK {
-		t.Errorf("NewClient, %d redirects = %d, %v; want 200", xhttp.DefaultRedirects, status, err)
+		t.Errorf("NewClient, %d redirects = %d, %v; want 200", ten, status, err)
 	}
 
-	if _, err := get(t.Context(), t, byDefault, atLimit+"1"); !errors.Is(err, xhttp.ErrRedirect) {
-		t.Errorf("NewClient, past %d redirects = %v, want ErrRedirect", xhttp.DefaultRedirects, err)
+	// One more, exactly: a client that followed eleven would pass a test of
+	// a hundred.
+	pastLimit := server.URL + "/?left=" + strconv.Itoa(ten+1)
+	if _, err := get(t.Context(), t, byDefault, pastLimit); !errors.Is(err, xhttp.ErrRedirect) {
+		t.Errorf("NewClient, %d redirects = %v, want ErrRedirect", ten+1, err)
 	}
 }

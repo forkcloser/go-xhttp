@@ -16,6 +16,12 @@ import (
 	"github.com/forkcloser/xhttp"
 )
 
+// The Backoff and the MaxBackoff of Options that name none.
+const (
+	defaultBackoff    = 500 * time.Millisecond
+	defaultMaxBackoff = 30 * time.Second
+)
+
 // drainLimit is how much of a response given up on is read before it is
 // closed, so that its connection carries the retry. The body is the server's
 // to size: past the limit the connection is given up with it.
@@ -27,11 +33,11 @@ type Options struct {
 	// Retries is how many times at most a request is sent again. Zero or
 	// less sends each request once.
 	Retries int
-	// Backoff is the wait before the first retry. Zero or less is
-	// DefaultBackoff.
+	// Backoff is the wait before the first retry. Zero or less is half a
+	// second.
 	Backoff time.Duration
 	// MaxBackoff is the longest wait before a retry, and the longest
-	// Retry-After obeyed. Zero or less is DefaultMaxBackoff.
+	// Retry-After obeyed. Zero or less is 30 seconds.
 	MaxBackoff time.Duration
 }
 
@@ -51,11 +57,11 @@ func NewTransport(base http.RoundTripper, options Options) http.RoundTripper {
 	}
 
 	if made.backoff <= 0 {
-		made.backoff = DefaultBackoff
+		made.backoff = defaultBackoff
 	}
 
 	if made.maxBackoff <= 0 {
-		made.maxBackoff = DefaultMaxBackoff
+		made.maxBackoff = defaultMaxBackoff
 	}
 
 	return made

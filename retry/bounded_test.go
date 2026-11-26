@@ -297,9 +297,10 @@ func TestRetries(t *testing.T) {
 	}
 }
 
-// TestTheDefaults: Options that name no Backoff wait DefaultBackoff, a
-// quarter less at most, and Options that name no MaxBackoff obey a
-// Retry-After up to DefaultMaxBackoff and no further.
+// TestTheDefaults: Options that name no Backoff wait about half a second,
+// held loosely, and Options that name no MaxBackoff obey a
+// Retry-After of 30 seconds and none of 31, as the docs say. The 30 seconds
+// are waited for real: nothing shorter tells them from 29.
 func TestTheDefaults(t *testing.T) {
 	t.Parallel()
 
@@ -316,14 +317,19 @@ func TestTheDefaults(t *testing.T) {
 		t.Fatalf("%d, %v; want 200", status, err)
 	}
 
+	// One wait is all a test sees, and it is jittered: half a second gives
+	// between 375 and 625 milliseconds. A timer never fires early, and fires
+	// late by what a loaded machine adds, so the upper bound is loose. What
+	// this always catches is a default under 300 milliseconds or over 2.7
+	// seconds; between the two, a changed default may pass.
 	sent := base.attempts()
-	if waited := sent[1].at.Sub(sent[0].at); waited < retry.DefaultBackoff*3/4 {
-		t.Errorf("with no Backoff named the wait was %v, want %v at least", waited, retry.DefaultBackoff*3/4)
+	if waited := sent[1].at.Sub(sent[0].at); waited < 375*time.Millisecond || waited > 2*time.Second {
+		t.Errorf("with no Backoff named the wait was %v, want half a second, a quarter less or more", waited)
 	}
 
 	for asked, again := range map[time.Duration]bool{
-		time.Second:                           true,
-		retry.DefaultMaxBackoff + time.Second: false,
+		30 * time.Second: true,
+		31 * time.Second: false,
 	} {
 		base = &scripted{script: failing(1, answer{
 			status: http.StatusServiceUnavailable,
