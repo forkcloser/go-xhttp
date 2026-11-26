@@ -71,7 +71,9 @@ package xhttp_test
 //     says (net/http, Request.Response: "the redirect response which caused
 //     this request to be created"); a client from NewClient follows ten
 //     redirects and no more; both are ErrRedirect;
-//   - an error that is not the posture's is the standard library's, unchanged.
+//   - an error that is not the posture's is the standard library's, unchanged;
+//   - a transport is safe for concurrent use (net/http: "A RoundTripper must
+//     be safe for concurrent use by multiple goroutines").
 //
 import (
 	"bufio"

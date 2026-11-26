@@ -4,7 +4,8 @@
 // asked for by name. The package keeps no state of its own, so a library
 // uses it as a program does: two transports share nothing but what the
 // standard library shares, the system's roots and the proxy the environment
-// names, which net/http reads once for the process.
+// names, which net/http reads once for the process. A transport, and a
+// client on one, are safe for concurrent use, as the standard library's are.
 //
 // # The baseline
 //

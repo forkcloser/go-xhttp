@@ -18,6 +18,7 @@ import (
 	"sync"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/forkcloser/xhttp"
 )
@@ -231,4 +232,80 @@ func TestAnErrorThatIsNotThePackagesIsNetHTTPs(t *testing.T) {
 			t.Errorf("%s: through net/http and through xhttp:\n%s\n%s", name, seen[0], seen[1])
 		}
 	}
+}
+
+// TestOneTransportCarriesManyRequestsAtOnce: sixty-four requests at once
+// through one transport, over each protocol, some answered whole, some
+// stalled, some refused, each get what is theirs. The race detector reads
+// the rest.
+func TestOneTransportCarriesManyRequestsAtOnce(t *testing.T) {
+	t.Parallel()
+
+	const (
+		callers = 64
+		stall   = 200 * time.Millisecond
+	)
+
+	versions(t, func(t *testing.T, _ int, serve func(http.Handler) (string, xhttp.Config)) {
+		t.Helper()
+
+		release := make(chan struct{})
+		stops := stalling(nil, release)
+
+		address, config := serve(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/stops" {
+				stops(w, r)
+
+				return
+			}
+
+			_, _ = io.Copy(w, r.Body)
+		}))
+
+		t.Cleanup(func() { close(release) })
+
+		config.StallTimeout = stall
+		transport := xhttp.NewTransport(config)
+
+		var group sync.WaitGroup
+
+		for caller := range callers {
+			group.Go(func() {
+				name := fmt.Sprintf("caller %d", caller)
+
+				path, body := "/echo", io.Reader(strings.NewReader(name))
+				if caller%4 == 0 {
+					path, body = "/stops", http.NoBody
+				}
+
+				req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, address+path, body)
+				if err != nil {
+					t.Error(err)
+
+					return
+				}
+
+				resp, err := transport.RoundTrip(req)
+				if err != nil {
+					t.Errorf("%s: %v", name, err)
+
+					return
+				}
+
+				content, err := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+
+				switch {
+				case resp.Request != req:
+					t.Errorf("%s: the response is another request's", name)
+				case path == "/stops" && (!errors.Is(err, xhttp.ErrStalled) || string(content) != "first"):
+					t.Errorf("%s: read %q, %v; want what arrived and ErrStalled", name, content, err)
+				case path == "/echo" && (err != nil || string(content) != name):
+					t.Errorf("%s: read %q, %v; want its own request back", name, content, err)
+				}
+			})
+		}
+
+		group.Wait()
+	})
 }
