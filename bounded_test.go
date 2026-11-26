@@ -525,6 +525,144 @@ func TestTheFirstCredentialForAHostIsSent(t *testing.T) {
 	}
 }
 
+// followed is a request for the last of the addresses, made as http.Client
+// makes one on a redirect: its Response is the answer to a request for the
+// address before it, and so on back to first.
+func followed(t *testing.T, first string, redirects ...string) *http.Request {
+	t.Helper()
+
+	made, err := http.NewRequestWithContext(t.Context(), http.MethodGet, first, http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, address := range redirects {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, address, http.NoBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		req.Response = &http.Response{StatusCode: http.StatusFound, Body: http.NoBody, Request: made}
+		made = req
+	}
+
+	return made
+}
+
+// authorization is the Authorization a request goes out with through a
+// transport that has the credentials.
+func authorization(t *testing.T, req *http.Request, held ...xhttp.Credential) string {
+	t.Helper()
+
+	var sent string
+
+	transport := xhttp.Authorize(
+		answering(func(req *http.Request) { sent = req.Header.Get("Authorization") }),
+		held...,
+	)
+
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = resp.Body.Close()
+
+	return sent
+}
+
+// TestCredentialAfterRedirects: every chain of up to three redirects that
+// ends at a host the credential names, through hosts it names and hosts it
+// does not. The token goes exactly when every request of the chain was
+// https and for a host the credential names.
+func TestCredentialAfterRedirects(t *testing.T) {
+	t.Parallel()
+
+	held := credential(t, "Bearer", "token", "registry.test", "mirror.test:8443", "registry.test:80")
+
+	// What a request before the last may be for, and whether the
+	// credential names it.
+	hops := map[string]bool{
+		"https://registry.test/":              true,
+		"https://REGISTRY.test:443/elsewhere": true,
+		"https://mirror.test:8443/":           true,
+		"https://mirror.test/":                false,
+		"https://foreign.test/":               false,
+		"https://sub.registry.test/":          false,
+		// Named, host and port, and cleartext: whoever is on the path
+		// wrote the redirect.
+		"http://registry.test/": false,
+	}
+
+	var walk func(chain []string, trusted bool, depth int)
+
+	walk = func(chain []string, trusted bool, depth int) {
+		addresses := append(slices.Clone(chain), "https://registry.test/v2/")
+		req := followed(t, addresses[0], addresses[1:]...)
+
+		want := ""
+		if trusted {
+			want = "Bearer token"
+		}
+
+		if got := authorization(t, req, held); got != want {
+			t.Errorf("after %q: Authorization %q, want %q", chain, got, want)
+		}
+
+		if depth == 0 {
+			return
+		}
+
+		for hop, named := range hops {
+			walk(append(slices.Clone(chain), hop), trusted && named, depth-1)
+		}
+	}
+
+	walk(nil, true, 3)
+}
+
+// TestCredentialAfterARedirectFromNowhere: a redirect whose response names
+// no request, or a request with no URL, tells nothing of where it came
+// from, and the token is withheld.
+func TestCredentialAfterARedirectFromNowhere(t *testing.T) {
+	t.Parallel()
+
+	held := credential(t, "Bearer", "token", "registry.test")
+
+	for what, via := range map[string]*http.Response{
+		"no request":            {StatusCode: http.StatusFound, Body: http.NoBody},
+		"a request with no URL": {StatusCode: http.StatusFound, Body: http.NoBody, Request: &http.Request{}},
+	} {
+		req := followed(t, "https://registry.test/")
+		req.Response = via
+
+		if got := authorization(t, req, held); got != "" {
+			t.Errorf("a redirect with %s: Authorization %q, want none", what, got)
+		}
+	}
+}
+
+// TestTheFirstCredentialForAHostDecides: when a redirect withholds the first
+// credential that names a host, no later one is sent in its place.
+func TestTheFirstCredentialForAHostDecides(t *testing.T) {
+	t.Parallel()
+
+	req := followed(t, "https://mirror.test/", "https://registry.test/")
+
+	got := authorization(
+		t,
+		req,
+		credential(t, "Bearer", "first", "registry.test"),
+		credential(t, "Bearer", "second", "registry.test", "mirror.test"),
+	)
+	if got != "" {
+		t.Errorf(
+			"Authorization %q, want none: the first credential for the host does not name where the redirect came from",
+			got,
+		)
+	}
+}
+
 func TestAuthorizeNeedsABase(t *testing.T) {
 	t.Parallel()
 

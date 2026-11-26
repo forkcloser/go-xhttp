@@ -25,7 +25,7 @@
 // A client from [NewClient] also follows at most ten redirects,
 // and none from https to anything else ([Redirects]). [Authorize] adds a
 // token to the requests for the hosts its [Credential] names, over https, and
-// to no other request.
+// to no other request, nor to one a redirect from another host led to.
 //
 // # Errors
 //

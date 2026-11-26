@@ -13,8 +13,10 @@ import (
 
 // Credential is a token and the hosts it is for, made by [NewCredential]. It
 // is sent to those hosts, over https, and to no other: not to a host a
-// redirect leads to, and not in cleartext. The zero Credential names no host
-// and is never sent.
+// redirect leads to, and not in cleartext. Nor is it sent with a request a
+// client makes on a redirect, unless every request that led there was https
+// and for a host it names: another host would be choosing what the token is
+// presented for. The zero Credential names no host and is never sent.
 type Credential struct {
 	// header is the Authorization field's value, scheme and token.
 	header string
@@ -177,12 +179,29 @@ func (a *authorizer) pick(req *http.Request) (Credential, bool) {
 	}
 
 	for _, credential := range a.credentials {
+		// The first that names the host decides: when a redirect withholds
+		// it, no other is sent in its place.
 		if credential.covers(req.URL) {
-			return credential, true
+			return credential, credential.led(req)
 		}
 	}
 
 	return Credential{}, false
+}
+
+// led reports whether every request that led to req, which a client makes
+// by following redirects, was https and for a host the credential names.
+func (c Credential) led(req *http.Request) bool {
+	for via := req.Response; via != nil; via = via.Request.Response {
+		// A response that names no request tells nothing of where it
+		// came from.
+		if via.Request == nil || via.Request.URL == nil ||
+			via.Request.URL.Scheme != https || !c.covers(via.Request.URL) {
+			return false
+		}
+	}
+
+	return true
 }
 
 // covers reports whether target's host is one the credential is for. The

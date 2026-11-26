@@ -32,6 +32,11 @@ package xhttp_test
 //     to another host, a redirect's target included, and not in cleartext.
 //     Of two credentials for a host the first is sent; a request's own
 //     Authorization header is kept; the zero Credential is never sent;
+//   - a request a client makes on a redirect (net/http: Request.Response is
+//     "the redirect response which caused this request to be created") gets
+//     the credential only when every request that led to it was https and
+//     for a host the credential names; when that withholds the first
+//     credential for a host, no other is sent;
 //   - Redirects follows at most its limit, and none from https to anything
 //     else: both are ErrRedirect;
 //   - an error that is not the posture's is the standard library's, unchanged.
@@ -679,7 +684,8 @@ func TestUserAgent(t *testing.T) {
 
 // TestCredentialGoesToItsHostsOnly: the token reaches the host it names,
 // and not the host a redirect leads to, a host it does not name, or a server
-// in cleartext.
+// in cleartext; nor the host it names when another host sent the client
+// there. The redirects are net/http's own client's.
 func TestCredentialGoesToItsHostsOnly(t *testing.T) {
 	t.Parallel()
 
@@ -694,18 +700,32 @@ func TestCredentialGoesToItsHostsOnly(t *testing.T) {
 		}
 	}
 
-	other, roots := secure(t, record(&elsewhere), nil)
+	var back atomic.Pointer[string]
+
+	other, roots := secure(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/back" {
+			http.Redirect(w, r, *back.Load()+"/chosen-elsewhere", http.StatusTemporaryRedirect)
+
+			return
+		}
+
+		record(&elsewhere)(w, r)
+	}, nil)
 
 	first, _ := secure(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/away":
 			http.Redirect(w, r, other.URL+"/asset", http.StatusFound)
+		case "/again":
+			http.Redirect(w, r, "/", http.StatusFound)
 		case "/own":
 			record(&own)(w, r)
 		default:
 			record(&named)(w, r)
 		}
 	}, nil)
+
+	back.Store(&first.URL)
 
 	plain := httptest.NewServer(record(&elsewhere))
 	t.Cleanup(plain.Close)
@@ -745,6 +765,8 @@ func TestCredentialGoesToItsHostsOnly(t *testing.T) {
 		{"the named host", first.URL + "/", &named, token},
 		{"a redirect to another host", first.URL + "/away", &elsewhere, ""},
 		{"a host no credential names", other.URL, &elsewhere, ""},
+		{"a redirect within the named host", first.URL + "/again", &named, token},
+		{"the named host, on a redirect from a host that is not named", other.URL + "/back", &named, ""},
 		{"a named host in cleartext", plain.URL, &elsewhere, ""},
 	} {
 		if _, err := get(t.Context(), t, client, step.address); err != nil {
