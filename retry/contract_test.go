@@ -1308,3 +1308,78 @@ func TestWhatMakesARequestOneThatIsSentOnce(t *testing.T) {
 		}
 	}
 }
+
+// TestOneTransportCarriesManyRequestsAtOnce: every request through one
+// transport, from many goroutines at once, gets its own retry and its own
+// answer. The race detector reads the rest.
+func TestOneTransportCarriesManyRequestsAtOnce(t *testing.T) {
+	t.Parallel()
+
+	const callers = 64
+
+	var (
+		mu       sync.Mutex
+		attempts = map[string]int{}
+	)
+
+	base := roundTripper(func(req *http.Request) (*http.Response, error) {
+		caller := req.Header.Get("X-Caller")
+
+		mu.Lock()
+		attempts[caller]++
+		first := attempts[caller] == 1
+		mu.Unlock()
+
+		status := http.StatusOK
+		if first {
+			status = http.StatusServiceUnavailable
+		}
+
+		return &http.Response{
+			StatusCode: status,
+			Header:     http.Header{"X-Caller": {caller}},
+			Body:       http.NoBody,
+			Request:    req,
+		}, nil
+	})
+
+	transport := retry.NewTransport(base, quick(1))
+
+	var group sync.WaitGroup
+
+	for caller := range callers {
+		group.Go(func() {
+			name := strconv.Itoa(caller)
+
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://server.test/", http.NoBody)
+			if err != nil {
+				t.Error(err)
+
+				return
+			}
+
+			req.Header.Set("X-Caller", name)
+
+			resp, err := transport.RoundTrip(req)
+			if err != nil {
+				t.Error(err)
+
+				return
+			}
+
+			_ = resp.Body.Close()
+
+			mu.Lock()
+			sent := attempts[name]
+			mu.Unlock()
+
+			if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Caller") != name || resp.Request != req ||
+				sent != 2 {
+				t.Errorf("caller %s: %d for caller %q after %d attempts; want its own 200 after 2",
+					name, resp.StatusCode, resp.Header.Get("X-Caller"), sent)
+			}
+		})
+	}
+
+	group.Wait()
+}

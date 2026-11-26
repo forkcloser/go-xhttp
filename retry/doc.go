@@ -4,6 +4,9 @@
 //	client := xhttp.NewClient(xhttp.Config{})
 //	client.Transport = retry.NewTransport(client.Transport, retry.Options{Retries: 3})
 //
+// A transport from NewTransport keeps nothing between two requests and is
+// safe for concurrent use, as the http.RoundTripper under it must be.
+//
 // # What is sent again
 //
 // A request whose attempt failed, or was answered 408, 429, 500, 502, 503 or
