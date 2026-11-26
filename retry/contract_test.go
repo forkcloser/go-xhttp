@@ -26,6 +26,8 @@ package retry_test
 //     each time, and never longer than MaxBackoff; a Retry-After that asks
 //     for longer is obeyed;
 //   - the caller's request is left as it was, and is the response's Request;
+//     a trailer the caller sets while the body is read is sent with each
+//     attempt;
 //   - a retry is a debug record with the method and the host, and no path;
 //   - the zero Options sends each request once; a nil base panics.
 
@@ -39,6 +41,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -860,6 +863,95 @@ func TestARetryIsLoggedWithoutThePath(t *testing.T) { //nolint:paralleltest // s
 			if strings.Contains(line.String(), secret) {
 				t.Errorf("%q holds %q, of the URL's path or query", line.String(), secret)
 			}
+		}
+	}
+}
+
+// trailing is a request body that sets a trailer of its request when it has
+// been read whole, as a caller that sends a checksum of what it streamed
+// does. The value names the reading, so that one left by an earlier reading
+// is told from this one's.
+type trailing struct {
+	io.Reader
+
+	req     *http.Request
+	reading int
+}
+
+func (b *trailing) Read(into []byte) (int, error) {
+	read, err := b.Reader.Read(into)
+	if errors.Is(err, io.EOF) {
+		b.req.Trailer.Set("X-Checksum", "of reading "+strconv.Itoa(b.reading))
+	}
+
+	return read, err
+}
+
+func (*trailing) Close() error { return nil }
+
+// TestATrailerIsSentWithEachAttempt: a retry goes out on a copy of the
+// request, and the copy must share the caller's trailers: the one set while
+// an attempt's body is read is the one that attempt sends, not what the map
+// held when the copy was made.
+func TestATrailerIsSentWithEachAttempt(t *testing.T) {
+	t.Parallel()
+
+	var (
+		mu      sync.Mutex
+		arrived []string
+	)
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		arrived = append(arrived, r.Trailer.Get("X-Checksum"))
+
+		if len(arrived) < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}))
+	t.Cleanup(server.Close)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, server.URL, http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// One map for the life of the request, declared before it is sent as
+	// net/http asks.
+	req.Trailer = http.Header{"X-Checksum": nil}
+
+	readings := 0
+	body := func() (io.ReadCloser, error) {
+		readings++
+
+		return &trailing{Reader: strings.NewReader("content"), req: req, reading: readings}, nil
+	}
+
+	req.Body, _ = body()
+	req.GetBody = body
+	req.ContentLength = -1
+
+	resp, err := retry.NewTransport(xhttp.NewTransport(xhttp.Config{Cleartext: true}), quick(3)).RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = resp.Body.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if resp.StatusCode != http.StatusOK || len(arrived) != 3 {
+		t.Fatalf("status %d after %d attempts; want 200 after 3", resp.StatusCode, len(arrived))
+	}
+
+	for attempt, got := range arrived {
+		if want := "of reading " + strconv.Itoa(attempt+1); got != want {
+			t.Errorf("attempt %d: the server saw the trailer %q, want %q", attempt+1, got, want)
 		}
 	}
 }

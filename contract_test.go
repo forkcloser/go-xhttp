@@ -16,6 +16,7 @@ package xhttp_test
 //     Close from another goroutine ends a read; the connection a protocol
 //     switch hands over is not watched;
 //   - the caller's request is left as it was, and is the response's Request;
+//     a trailer the caller sets while the body is read is sent;
 //   - UserAgent is the User-Agent of a request that has no such header;
 //   - a Credential is sent to the hosts it names, over https, and to no
 //     other, a redirect's target included; a request's own Authorization
@@ -783,5 +784,70 @@ func TestRedirectsWithinHTTPSOnly(t *testing.T) {
 
 	if _, err := get(t.Context(), t, client, server.URL+"/down"); !errors.Is(err, xhttp.ErrRedirect) {
 		t.Errorf("a redirect from https to http = %v, want ErrRedirect", err)
+	}
+}
+
+// trailing is a request body that sets a trailer of its request when it has
+// been read whole, as a caller that sends a checksum of what it streamed does.
+type trailing struct {
+	io.Reader
+
+	req *http.Request
+}
+
+func (b *trailing) Read(into []byte) (int, error) {
+	read, err := b.Reader.Read(into)
+	if errors.Is(err, io.EOF) {
+		b.req.Trailer.Set("X-Checksum", "of the content")
+	}
+
+	return read, err
+}
+
+func (*trailing) Close() error { return nil }
+
+// TestATrailerSetWhileTheBodyIsReadIsSent: a transport sends a copy of the
+// request, and the copy must share the caller's trailers, which are not
+// there yet when it is made.
+func TestATrailerSetWhileTheBodyIsReadIsSent(t *testing.T) {
+	t.Parallel()
+
+	var arrived atomic.Pointer[string]
+
+	server, roots := secure(t, func(_ http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+
+		got := r.Trailer.Get("X-Checksum")
+		arrived.Store(&got)
+	}, nil)
+
+	bare := xhttp.NewTransport(xhttp.Config{Roots: roots, UserAgent: "contract/1"})
+
+	for name, transport := range map[string]http.RoundTripper{
+		"a transport": bare,
+		"a transport with a credential": xhttp.Authorize(
+			bare,
+			xhttp.Credential{Token: "token", Hosts: []string{strings.TrimPrefix(server.URL, "https://")}},
+		),
+	} {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, server.URL, http.NoBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		req.Body = &trailing{Reader: strings.NewReader("content"), req: req}
+		req.ContentLength = -1
+		req.Trailer = http.Header{"X-Checksum": nil}
+
+		resp, err := transport.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_ = resp.Body.Close()
+
+		if got := arrived.Swap(nil); got == nil || *got != "of the content" {
+			t.Errorf("%s: the server saw the trailer %v, want the one set as the body ended", name, got)
+		}
 	}
 }
