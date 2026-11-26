@@ -11,7 +11,9 @@ package xhttp_test
 //   - Offline fails every request with ErrOffline, and nothing is dialed;
 //   - a request the posture refuses has its body closed, as RoundTrip must;
 //   - a read of a response body that waits longer than StallTimeout for a
-//     byte fails with ErrStalled, over HTTP/1 and HTTP/2; the time between
+//     byte fails with ErrStalled, over HTTP/1 and HTTP/2, and with neither
+//     of the context's errors, since nothing of the caller's ended; an
+//     error of that body afterwards is its own; the time between
 //     two reads is not counted; a negative StallTimeout waits for ever; a
 //     Close from another goroutine ends a read; the connection a protocol
 //     switch hands over is not watched;
@@ -373,10 +375,24 @@ func TestStalledBody(t *testing.T) {
 		stopped := open(t, client, address+"/stops", major)
 
 		content, err := io.ReadAll(stopped.Body)
-		_ = stopped.Body.Close()
 
 		if !errors.Is(err, xhttp.ErrStalled) || string(content) != "first" {
 			t.Errorf("a body that stops: read %q, %v; want what arrived and ErrStalled", content, err)
+		}
+
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("a body that stops: %v is also a context's error, and no context of the caller's ended", err)
+		}
+
+		if _, again := stopped.Body.Read(make([]byte, 1)); !errors.Is(again, xhttp.ErrStalled) ||
+			errors.Is(again, context.Canceled) {
+			t.Errorf("a second read of a stalled body: %v, want ErrStalled alone", again)
+		}
+
+		_ = stopped.Body.Close()
+
+		if _, closed := stopped.Body.Read(make([]byte, 1)); closed == nil || errors.Is(closed, xhttp.ErrStalled) {
+			t.Errorf("a read of a stalled body after its Close: %v, want the error of a closed body", closed)
 		}
 
 		paused := open(t, client, address+"/paused", major)

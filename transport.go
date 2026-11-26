@@ -9,6 +9,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
@@ -188,6 +189,7 @@ type watchedBody struct {
 	timer  *time.Timer
 	ctx    context.Context //nolint:containedctx // the request's, kept to read why a read failed
 	cancel context.CancelCauseFunc
+	closed atomic.Bool
 }
 
 // watch wraps body. The timer is made here, stopped, and the field never
@@ -208,18 +210,24 @@ func (b *watchedBody) Read(buf []byte) (int, error) {
 	b.timer.Stop()
 
 	// A body whose end arrived is whole, whatever the timer did meanwhile.
-	if err == nil || errors.Is(err, io.EOF) || errors.Is(err, ErrStalled) {
+	if err == nil || errors.Is(err, io.EOF) {
 		return read, err //nolint:wrapcheck // the body's own error, unchanged
 	}
 
-	if errors.Is(context.Cause(b.ctx), ErrStalled) {
-		return read, fmt.Errorf("%w: %w", ErrStalled, err)
+	// Once the watch has fired, a read fails with ErrStalled and nothing
+	// else, whatever the body says: over HTTP/2 that is the error of the
+	// context cancelled, which is this transport's own and no context of
+	// the caller's, and over HTTP/1 a second read finds a closed connection.
+	// A body the caller has closed says so itself.
+	if !b.closed.Load() && errors.Is(context.Cause(b.ctx), ErrStalled) {
+		return read, ErrStalled
 	}
 
 	return read, err //nolint:wrapcheck // the body's own error, unchanged
 }
 
 func (b *watchedBody) Close() error {
+	b.closed.Store(true)
 	b.timer.Stop()
 
 	err := b.ReadCloser.Close()
