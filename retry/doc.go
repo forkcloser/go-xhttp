@@ -4,26 +4,40 @@
 //	client := xhttp.NewClient(xhttp.Config{})
 //	client.Transport = retry.NewTransport(client.Transport, retry.Options{Retries: 3})
 //
+// A transport from NewTransport keeps nothing between two requests and is
+// safe for concurrent use, as the http.RoundTripper under it must be.
+//
 // # What is sent again
 //
-// A request whose attempt failed, or was answered 429, 500, 502, 503 or 504,
-// when sending it twice does what sending it once does: its method is GET,
-// HEAD, OPTIONS, TRACE, PUT or DELETE, the idempotent methods of RFC 9110
+// A request whose attempt failed, or was answered 408, 429, 500, 502, 503 or
+// 504, when sending it twice does what sending it once does: its method is
+// GET, HEAD, OPTIONS, TRACE, PUT or DELETE, the idempotent methods of RFC 9110
 // section 9.2.2, or it carries an Idempotency-Key or X-Idempotency-Key header,
 // whatever its value, as net/http reads it. Any other request is sent again
 // only when no connection could be made, since nothing was sent.
 //
 // A request with a body is sent again only if it has a GetBody, which
 // http.NewRequest sets for a body in memory. One whose body is a stream is
-// sent once.
+// sent once. So is one that has a Trailer, whatever it declares: a caller
+// sets trailers while the body is read, an http.RoundTripper may still be
+// reading both after it has answered, and two attempts would have the one
+// Trailer between them.
+//
+// The same section of RFC 9110 ends: "A client SHOULD NOT automatically retry
+// a failed automatic retry." With [Options.Retries] above one this package
+// does, on purpose, as a backoff presumes; and net/http's own transport may
+// already have sent a request twice under it, when a connection it reused
+// turned out closed.
 //
 // # What is not
 //
 // A failure no further attempt changes: the request's context is done; the
 // certificate is not trusted; the host does not resolve; xhttp refused the
 // request (xhttp.ErrOffline, xhttp.ErrCleartext) or the server refused the
-// TLS handshake (xhttp.ErrHandshakeRefused). Every other error is taken for
-// one that may pass.
+// TLS handshake (xhttp.ErrHandshakeRefused); the request has no URL or no
+// header map, which an http.RoundTripper is owed. Every other error is taken
+// for one that may pass, one of the request's own making included: net/http
+// gives those no type to tell them by.
 //
 // # What comes back
 //
@@ -36,21 +50,30 @@
 // read again after all.
 //
 // One case is an error of this package's making. A response that is to be
-// retried is closed before the wait, so that its connection carries the
-// retry; when the request's context is cancelled during that wait there is
-// no answer left to give, and the error is the context's. It wraps the
-// attempt's error when the attempt had failed, and names the status when it
-// had been answered.
+// retried is closed before the wait, and what the server had yet to send of
+// it is not read; when the request's context is cancelled during that wait
+// there is no answer left to give, and the error is the context's. It wraps
+// the attempt's error when the attempt had failed, and names the status when
+// it had been answered.
 //
 // # Waiting
 //
-// The wait before a retry starts at [Options.Backoff] and doubles, each wait
-// a quarter longer or shorter at random, and is never longer than
-// [Options.MaxBackoff]. A Retry-After header, in seconds or as a date, is
-// obeyed when it asks for longer. A server that asks for more than MaxBackoff
-// is not asked again, and its response comes back. A wait that would outlast
-// the context's deadline is not begun.
+// The wait before a retry starts at [Options.Backoff] and doubles, up to
+// [Options.MaxBackoff]. Each is drawn at random between three quarters of
+// that and five quarters, or MaxBackoff when that is less, so that the
+// clients a server turned away together do not come back together. No wait
+// is longer than MaxBackoff.
+//
+// A Retry-After header, in seconds or as a date, is obeyed when it asks for
+// longer: the wait is what it asks and up to a quarter more, at random and
+// for the same reason, and MaxBackoff at most. A server that asks for more
+// than MaxBackoff is not asked again, and its response comes back. A wait
+// that would outlast the context's deadline is not begun.
 //
 // A retry is a log/slog record at the debug level, with the method, the host
-// and the cause, and never the path or the query.
+// and the cause: the status, or the attempt's error. The package writes
+// neither the path nor the query, and of an error net/http's client worded,
+// a *url.Error that holds the whole URL, the record has the error inside.
+// An error that another transport words with the URL in it is logged as that
+// transport worded it.
 package retry

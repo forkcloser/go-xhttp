@@ -5,7 +5,8 @@ package retry_test
 // 9110 for the idempotent methods (section 9.2.2) and Retry-After (section
 // 10.2.3):
 //   - a request is sent again, Retries times at most, when its attempt
-//     failed or was answered 429, 500, 502, 503 or 504, and it is idempotent:
+//     failed or was answered 408 (RFC 9110, 15.5.9: the client "MAY repeat
+//     that request"), 429, 500, 502, 503 or 504, and it is idempotent:
 //     GET, HEAD, OPTIONS, TRACE, PUT, DELETE, or any method with an
 //     Idempotency-Key or X-Idempotency-Key header, whatever its value;
 //   - any other request is sent once, unless no connection could be made;
@@ -14,33 +15,51 @@ package retry_test
 //   - nothing is sent again once the request's context is done, for a
 //     certificate that is not trusted, for a host that does not resolve, or
 //     for what xhttp refuses: ErrOffline, ErrCleartext, ErrHandshakeRefused;
+//     nor a request with no URL or no header map (RoundTripper: "The
+//     Request's URL and Header fields must be initialized");
 //   - a request that is not sent again keeps the answer it has, as its
 //     transport gave it: the response whatever the status, or the error
 //     unchanged. That is when no retry is left, when Retry-After asks for
 //     more than MaxBackoff, when the context is done already or its deadline
 //     falls before the wait would end, and when GetBody fails;
-//   - a response given up on to wait is closed, and its connection carries
-//     the retry; a context cancelled during that wait ends it, and the error
-//     is the context's, holding the attempt's error if it had one;
-//   - the wait before a retry is at least three quarters of Backoff doubled
-//     each time, and never longer than MaxBackoff; a Retry-After that asks
-//     for longer is obeyed;
+//   - a response given up on to wait is closed and not read: what the
+//     server has yet to send of it is not waited for. A context cancelled
+//     during the wait ends it, and the error is the context's, holding the
+//     attempt's error if it had one;
+//   - the wait before a retry is drawn evenly between three quarters and
+//     five quarters of Backoff doubled each time up to MaxBackoff, or to
+//     MaxBackoff when that is less: no wait is longer, and they do not
+//     gather on it. A Retry-After that asks for longer is obeyed (RFC 9110,
+//     10.2.3: "how long the user agent ought to wait"), drawn evenly from
+//     what it asks to a quarter more, or to MaxBackoff. It asks as a delay,
+//     which is digits and nothing else (delay-seconds = 1*DIGIT), or as a
+//     date; a value that is neither asks for nothing;
+//   - a request that has a Trailer is sent once, and nothing of the Trailer
+//     is read once the request is with the transport under this one: it is
+//     filled as the body is read (net/http, Request.Trailer: "the map values can be
+//     updated while the request body is read"), and a RoundTripper may read
+//     the body, and close it, "in a separate goroutine even after RoundTrip
+//     returns", so that two attempts would use the one map at once;
 //   - the caller's request is left as it was, and is the response's Request;
-//     a trailer the caller sets while the body is read is sent with each
-//     attempt;
-//   - a retry is a debug record with the method and the host, and no path;
-//   - the zero Options sends each request once; a nil base panics.
+//   - a retry is a debug record with the method, the host and the cause,
+//     the status or the error, and no path and no query, those of a
+//     *url.Error included (net/url: "Error reports an error and the
+//     operation and URL that caused it");
+//   - the zero Options sends each request once; a nil base panics, and so
+//     does a negative Retries, Backoff or MaxBackoff.
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -74,11 +93,19 @@ type attempt struct {
 	at     time.Time
 }
 
-// tracked is a response body that records its Close.
+// tracked is a response body that records its Close, and how often it was
+// read.
 type tracked struct {
 	io.Reader
 
 	closed atomic.Bool
+	reads  atomic.Int32
+}
+
+func (b *tracked) Read(into []byte) (int, error) {
+	b.reads.Add(1)
+
+	return b.Reader.Read(into)
 }
 
 func (b *tracked) Close() error {
@@ -216,7 +243,7 @@ func TestAnIdempotentRequestIsSentAgain(t *testing.T) {
 
 // TestWhatComesBackIsTheLastAttempts: the response whatever its status, as
 // a RoundTripper must, or the error itself; and every response given up on
-// is closed, the last one left to the caller.
+// is closed and was never read, the last one left to the caller.
 func TestWhatComesBackIsTheLastAttempts(t *testing.T) {
 	t.Parallel()
 
@@ -245,6 +272,10 @@ func TestWhatComesBackIsTheLastAttempts(t *testing.T) {
 	for index, body := range base.bodies {
 		if last := index == len(base.bodies)-1; body.closed.Load() == last {
 			t.Errorf("the body of attempt %d: closed %t, want %t", index+1, !last, last)
+		}
+
+		if reads := body.reads.Load(); reads != 0 {
+			t.Errorf("the body of attempt %d was read %d times before the caller had it", index+1, reads)
 		}
 	}
 
@@ -295,7 +326,8 @@ func TestARequestThatIsNotIdempotentIsSentOnce(t *testing.T) {
 }
 
 // TestNoConnectionIsNothingSent: a request that is not idempotent is sent
-// again when the connection could not be made.
+// again when the connection could not be made, to the server or to the
+// proxy before it.
 func TestNoConnectionIsNothingSent(t *testing.T) {
 	t.Parallel()
 
@@ -311,26 +343,75 @@ func TestNoConnectionIsNothingSent(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	const retries = 2
-
-	base := &counting{base: xhttp.NewTransport(xhttp.Config{Cleartext: true})}
-
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, address, strings.NewReader("content"))
+	nowhere, err := url.Parse(address)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	resp, err := retry.NewTransport(base, quick(retries)).RoundTrip(req)
-	if resp != nil {
-		_ = resp.Body.Close()
-	}
+	const retries = 2
 
-	if refused, found := errors.AsType[*net.OpError](err); !found || refused.Op != "dial" {
-		t.Fatalf("a request to a closed port = %v, want the dial's error", err)
-	}
+	for what, sent := range map[string]struct {
+		config  xhttp.Config
+		address string
+		op      string
+	}{
+		"a closed port":                   {xhttp.Config{Cleartext: true}, address, "dial"},
+		"a proxy on a closed port":        {xhttp.Config{Cleartext: true, Proxy: http.ProxyURL(nowhere)}, "http://server.test/", "proxyconnect"},
+		"https, a proxy on a closed port": {xhttp.Config{Cleartext: true, Proxy: http.ProxyURL(nowhere)}, "https://server.test/", "proxyconnect"},
+	} {
+		base := &counting{base: xhttp.NewTransport(sent.config)}
 
-	if base.count.Load() != retries+1 {
-		t.Errorf("a POST no connection carried was attempted %d times, want %d", base.count.Load(), retries+1)
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, sent.address, strings.NewReader("content"))
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		resp, err := retry.NewTransport(base, quick(retries)).RoundTrip(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+
+		// The first OpError of the chain is the one net/http made.
+		if refused, found := errors.AsType[*net.OpError](err); !found || refused.Op != sent.op {
+			t.Fatalf("%s: %v, want a %s error", what, err, sent.op)
+		}
+
+		if base.count.Load() != retries+1 {
+			t.Errorf("%s: a POST no connection carried was attempted %d times, want %d",
+				what, base.count.Load(), retries+1)
+		}
+	}
+}
+
+// TestWhatCountsAsNoConnection: a dial's error anywhere under the errors
+// net wraps it in, and no other error of the network.
+func TestWhatCountsAsNoConnection(t *testing.T) {
+	t.Parallel()
+
+	dial := &net.OpError{Op: "dial", Net: "tcp", Err: errFlaky}
+
+	const retries = 2
+
+	for what, failure := range map[string]struct {
+		err      error
+		attempts int
+	}{
+		"a dial":                       {dial, retries + 1},
+		"a dial under a proxy's error": {&net.OpError{Op: "proxyconnect", Net: "tcp", Err: dial}, retries + 1},
+		"the same, wrapped in between": {&net.OpError{Op: "proxyconnect", Err: fmt.Errorf("%w: wrapped", dial)}, retries + 1},
+		"a read":                       {&net.OpError{Op: "read", Net: "tcp", Err: errFlaky}, 1},
+		"a read under a proxy's error": {&net.OpError{Op: "proxyconnect", Err: &net.OpError{Op: "read", Err: errFlaky}}, 1},
+		"a proxy's error with no dial": {&net.OpError{Op: "proxyconnect", Net: "tcp", Err: errFlaky}, 1},
+		"an error that is not net's":   {errFlaky, 1},
+		"a write":                      {&net.OpError{Op: "write", Net: "tcp", Err: errFlaky}, 1},
+		"a dial under a read":          {&net.OpError{Op: "read", Net: "tcp", Err: dial}, retries + 1},
+	} {
+		base := &scripted{script: failing(retries+1, answer{err: failure.err})}
+
+		if _, err := send(t, base, quick(retries), http.MethodPost, nil); !errors.Is(err, failure.err) ||
+			len(base.attempts()) != failure.attempts {
+			t.Errorf("%s: %v after %d attempts, want %d", what, err, len(base.attempts()), failure.attempts)
+		}
 	}
 }
 
@@ -394,7 +475,13 @@ func TestABodyIsSentAgainWhole(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	req.GetBody = func() (io.ReadCloser, error) { return nil, errBodyGone }
+	var asked int
+
+	req.GetBody = func() (io.ReadCloser, error) {
+		asked++
+
+		return nil, errBodyGone
+	}
 
 	resp, err := retry.NewTransport(base, quick(3)).RoundTrip(req)
 	if err != nil || resp.StatusCode != http.StatusServiceUnavailable || len(base.attempts()) != 1 {
@@ -404,6 +491,10 @@ func TestABodyIsSentAgainWhole(t *testing.T) {
 			err,
 			len(base.attempts()),
 		)
+	}
+
+	if asked != 1 {
+		t.Errorf("a GetBody that fails was asked %d times, want once: the answer in hand is kept", asked)
 	}
 
 	content, err := io.ReadAll(resp.Body)
@@ -478,6 +569,25 @@ func TestWhatNoAttemptChangesIsNotRetried(t *testing.T) {
 				t.Errorf("%v after %d attempts; want its own error after 1", err, base.count.Load())
 			}
 		})
+	}
+}
+
+// TestALookupThatMayPassIsTriedAgain: of the errors of a lookup, only the
+// one that says the host does not exist ends the attempts.
+func TestALookupThatMayPassIsTriedAgain(t *testing.T) {
+	t.Parallel()
+
+	for what, lookup := range map[string]*net.DNSError{
+		"a lookup that timed out":          {Err: "i/o timeout", Name: "server.test", IsTimeout: true},
+		"a server that could not answer":   {Err: "server misbehaving", Name: "server.test", IsTemporary: true},
+		"an error the resolver calls none": {Err: "lookup failed", Name: "server.test"},
+	} {
+		base := &scripted{script: failing(1, answer{err: lookup})}
+
+		if status, err := send(t, base, quick(1), http.MethodGet, nil); err != nil || status != http.StatusOK ||
+			len(base.attempts()) != 2 {
+			t.Errorf("%s: %d, %v after %d attempts; want 200 after 2", what, status, err, len(base.attempts()))
+		}
 	}
 }
 
@@ -685,48 +795,66 @@ func TestTheCallersRequestIsLeftAsItWas(t *testing.T) {
 	}
 }
 
-// TestAResponseGivenUpOnLeavesItsConnection: the three attempts of one
-// request travel on one connection.
-func TestAResponseGivenUpOnLeavesItsConnection(t *testing.T) {
+// TestAResponseGivenUpOnIsNotWaitedFor: a server that answers 503 and then
+// holds the rest of its body does not hold the caller. The transport under
+// it is net/http's own, with no limit of its own on a body.
+func TestAResponseGivenUpOnIsNotWaitedFor(t *testing.T) {
 	t.Parallel()
 
-	var connections, requests atomic.Int32
+	var requests atomic.Int32
 
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if requests.Add(1) < 3 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write(bytes.Repeat([]byte("try later. "), 1000))
+	release := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) > 1 {
+			return
+		}
+
+		w.Header().Set("Content-Length", "1000")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("try later. "))
+		_ = http.NewResponseController(w).Flush()
+
+		select {
+		case <-release:
+		case <-r.Context().Done():
 		}
 	}))
-	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
-		if state == http.StateNew {
-			connections.Add(1)
-		}
-	}
-	server.Start()
 	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(release) })
 
-	client := xhttp.NewClient(xhttp.Config{Cleartext: true})
-	client.Transport = retry.NewTransport(client.Transport, quick(3))
+	standard := &http.Transport{}
+	t.Cleanup(standard.CloseIdleConnections)
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, http.NoBody)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	answered := make(chan error, 1)
 
-	_ = resp.Body.Close()
+	go func() {
+		resp, err := retry.NewTransport(standard, quick(1)).RoundTrip(req)
+		if err == nil {
+			_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK || requests.Load() != 3 {
-		t.Fatalf("status %d after %d requests; want 200 after 3", resp.StatusCode, requests.Load())
-	}
+			if resp.StatusCode != http.StatusOK {
+				err = fmt.Errorf("%w: status %d", errFlaky, resp.StatusCode)
+			}
+		}
 
-	if connections.Load() != 1 {
-		t.Errorf("the attempts travelled on %d connections, want 1", connections.Load())
+		answered <- err
+	}()
+
+	select {
+	case err := <-answered:
+		if err != nil || requests.Load() != 2 {
+			t.Errorf("%v after %d requests; want a 200 after 2", err, requests.Load())
+		}
+	// Far past what two requests to a local server take: the server holds
+	// its body until the test ends.
+	case <-time.After(30 * time.Second):
+		t.Fatal("RoundTrip waits for the rest of a response it gave up on")
 	}
 }
 
@@ -734,14 +862,51 @@ func TestTheZeroOptionsSendOnce(t *testing.T) {
 	t.Parallel()
 
 	for name, options := range map[string]retry.Options{
-		"the zero Options":   {},
-		"a negative Retries": {Retries: -1, Backoff: time.Millisecond},
+		"the zero Options":       {},
+		"no Retries, and a wait": {Backoff: time.Millisecond, MaxBackoff: time.Millisecond},
 	} {
 		base := &scripted{script: failing(2, answer{status: http.StatusServiceUnavailable})}
 
 		status, err := send(t, base, options, http.MethodGet, nil)
 		if err != nil || status != http.StatusServiceUnavailable || len(base.attempts()) != 1 {
 			t.Errorf("%s: %d, %v after %d attempts; want the 503 after 1", name, status, err, len(base.attempts()))
+		}
+	}
+}
+
+// TestNewTransportRefusesANegativeOption: a count or a wait below zero is
+// refused when the transport is made, and the smallest of each that is not
+// is taken.
+func TestNewTransportRefusesANegativeOption(t *testing.T) {
+	t.Parallel()
+
+	panics := func(options retry.Options) (panicked bool) {
+		defer func() { panicked = recover() != nil }()
+
+		retry.NewTransport(&scripted{}, options)
+
+		return false
+	}
+
+	for name, options := range map[string]retry.Options{
+		"a negative Retries":        {Retries: -1},
+		"a negative Backoff":        {Retries: 1, Backoff: -1},
+		"a negative MaxBackoff":     {Retries: 1, MaxBackoff: -1},
+		"the most negative Retries": {Retries: math.MinInt},
+		"the most negative Backoff": {Backoff: math.MinInt64},
+	} {
+		if !panics(options) {
+			t.Errorf("%s: NewTransport did not panic", name)
+		}
+	}
+
+	for name, options := range map[string]retry.Options{
+		"zeros":                     {},
+		"a nanosecond of each wait": {Retries: 1, Backoff: 1, MaxBackoff: 1},
+		"the largest of each":       {Retries: math.MaxInt, Backoff: math.MaxInt64, MaxBackoff: math.MaxInt64},
+	} {
+		if panics(options) {
+			t.Errorf("%s: NewTransport panicked", name)
 		}
 	}
 }
@@ -797,6 +962,56 @@ func TestABaseThatAnswersNothing(t *testing.T) {
 	}
 }
 
+// TestAResponseWithNoBody: a base may give a response a nil Body, which
+// net/http's client takes for an empty one (https://go.dev/issue/38095). A
+// retry gives such a response up as any other.
+func TestAResponseWithNoBody(t *testing.T) {
+	t.Parallel()
+
+	var attempts int
+
+	bodiless := roundTripper(func(req *http.Request) (*http.Response, error) {
+		attempts++
+
+		if attempts == 1 {
+			return &http.Response{StatusCode: http.StatusServiceUnavailable, Header: http.Header{}, Request: req}, nil
+		}
+
+		return &http.Response{StatusCode: http.StatusOK, Header: http.Header{}, Body: http.NoBody, Request: req}, nil
+	})
+
+	if status, err := send(t, bodiless, quick(1), http.MethodGet, nil); status != http.StatusOK || err != nil ||
+		attempts != 2 {
+		t.Errorf("%d, %v after %d attempts; want 200 after 2", status, err, attempts)
+	}
+}
+
+// TestARequestNotInitializedIsRefusedOnce: a request with no URL, or no
+// header map, is the transport's under it to refuse, and is given to it
+// once.
+func TestARequestNotInitializedIsRefusedOnce(t *testing.T) {
+	t.Parallel()
+
+	for what, edit := range map[string]func(*http.Request){
+		"no URL":        func(req *http.Request) { req.URL = nil },
+		"no header map": func(req *http.Request) { req.Header = nil },
+	} {
+		standard := &http.Transport{}
+		t.Cleanup(standard.CloseIdleConnections)
+
+		base := &counting{base: standard}
+
+		if _, err := send(t, base, quick(3), http.MethodGet, edit); err == nil || base.count.Load() != 1 {
+			t.Errorf(
+				"a request with %s: %v after %d attempts, want net/http's error after 1",
+				what,
+				err,
+				base.count.Load(),
+			)
+		}
+	}
+}
+
 // records is a slog handler that keeps what it is given.
 type records struct {
 	mu   sync.Mutex
@@ -818,9 +1033,10 @@ func (r *records) WithAttrs([]slog.Attr) slog.Handler { return r }
 func (r *records) WithGroup(string) slog.Handler      { return r }
 
 // TestARetryIsLoggedWithoutThePath: one debug record for each retry, with
-// the method and the host, and nothing of the path or the query, where a
-// signed URL keeps its secret. The default logger is the process's, which is
-// why this does not run in parallel.
+// the method, the host and the cause, and nothing of the path or the query,
+// where a signed URL keeps its secret: not from the request, and not from an
+// error net/http's client worded with the URL. The default logger is the
+// process's, which is why this does not run in parallel.
 func TestARetryIsLoggedWithoutThePath(t *testing.T) { //nolint:paralleltest // slog's default logger is process-wide
 	previous := slog.Default()
 
@@ -829,17 +1045,34 @@ func TestARetryIsLoggedWithoutThePath(t *testing.T) { //nolint:paralleltest // s
 	kept := &records{}
 	slog.SetDefault(slog.New(kept))
 
-	base := &scripted{script: []answer{{status: http.StatusServiceUnavailable}, {err: errFlaky}}}
+	// As net/http's client words an error, alone and inside another.
+	worded := &url.Error{Op: "Get", URL: "https://server.test/path?query=secret", Err: errFlaky}
 
-	if status, err := send(t, base, quick(3), http.MethodGet, nil); err != nil || status != http.StatusOK {
+	// A client's error that holds another client's, for another URL.
+	issuer := &url.Error{Op: "Post", URL: "https://issuer.test/token?assertion=secret", Err: errFlaky}
+
+	base := &scripted{script: []answer{
+		{status: http.StatusServiceUnavailable},
+		{err: errFlaky},
+		{err: worded},
+		{err: fmt.Errorf("fetching a token: %w", worded)},
+		{err: &url.Error{Op: "Get", URL: worded.URL, Err: issuer}},
+		{err: &url.Error{Op: "Get", URL: worded.URL, Err: fmt.Errorf("fetching a token: %w", issuer)}},
+	}}
+
+	causes := []string{
+		"status=503", errFlaky.Error(), errFlaky.Error(), errFlaky.Error(), errFlaky.Error(), errFlaky.Error(),
+	}
+
+	if status, err := send(t, base, quick(len(causes)), http.MethodGet, nil); err != nil || status != http.StatusOK {
 		t.Fatalf("%d, %v; want 200", status, err)
 	}
 
-	if len(kept.kept) != 2 {
-		t.Fatalf("%d records for 2 retries", len(kept.kept))
+	if len(kept.kept) != len(causes) {
+		t.Fatalf("%d records for %d retries", len(kept.kept), len(causes))
 	}
 
-	for _, record := range kept.kept {
+	for index, record := range kept.kept {
 		var line strings.Builder
 
 		line.WriteString(record.Message)
@@ -853,13 +1086,13 @@ func TestARetryIsLoggedWithoutThePath(t *testing.T) { //nolint:paralleltest // s
 			t.Errorf("%q is at level %v, want debug", line.String(), record.Level)
 		}
 
-		for _, want := range []string{"method=GET", "host=server.test"} {
+		for _, want := range []string{"method=GET", "host=server.test", "retry=" + strconv.Itoa(index+1), causes[index]} {
 			if !strings.Contains(line.String(), want) {
 				t.Errorf("%q does not say %s", line.String(), want)
 			}
 		}
 
-		for _, secret := range []string{"path", "query", "secret"} {
+		for _, secret := range []string{"path", "query", "secret", "issuer", "assertion"} {
 			if strings.Contains(line.String(), secret) {
 				t.Errorf("%q holds %q, of the URL's path or query", line.String(), secret)
 			}
@@ -889,11 +1122,10 @@ func (b *trailing) Read(into []byte) (int, error) {
 
 func (*trailing) Close() error { return nil }
 
-// TestATrailerIsSentWithEachAttempt: a retry goes out on a copy of the
-// request, and the copy must share the caller's trailers: the one set while
-// an attempt's body is read is the one that attempt sends, not what the map
-// held when the copy was made.
-func TestATrailerIsSentWithEachAttempt(t *testing.T) {
+// TestARequestWithTrailersIsSentOnce: a request that declares trailers gets
+// one attempt, whose answer comes back, and its trailer arrives as its body
+// set it.
+func TestARequestWithTrailersIsSentOnce(t *testing.T) {
 	t.Parallel()
 
 	var (
@@ -909,9 +1141,7 @@ func TestATrailerIsSentWithEachAttempt(t *testing.T) {
 
 		arrived = append(arrived, r.Trailer.Get("X-Checksum"))
 
-		if len(arrived) < 3 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-		}
+		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	t.Cleanup(server.Close)
 
@@ -920,8 +1150,7 @@ func TestATrailerIsSentWithEachAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// One map for the life of the request, declared before it is sent as
-	// net/http asks.
+	// Declared before the request is sent, as net/http asks.
 	req.Trailer = http.Header{"X-Checksum": nil}
 
 	readings := 0
@@ -945,13 +1174,212 @@ func TestATrailerIsSentWithEachAttempt(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if resp.StatusCode != http.StatusOK || len(arrived) != 3 {
-		t.Fatalf("status %d after %d attempts; want 200 after 3", resp.StatusCode, len(arrived))
+	if resp.StatusCode != http.StatusServiceUnavailable || len(arrived) != 1 || readings != 1 {
+		t.Fatalf("status %d after %d attempts and %d bodies; want the 503 after 1 and 1",
+			resp.StatusCode, len(arrived), readings)
 	}
 
-	for attempt, got := range arrived {
-		if want := "of reading " + strconv.Itoa(attempt+1); got != want {
-			t.Errorf("attempt %d: the server saw the trailer %q, want %q", attempt+1, got, want)
+	if arrived[0] != "of reading 1" {
+		t.Errorf("the server saw the trailer %q, want the one the body set", arrived[0])
+	}
+}
+
+// eager is a request body that is read a few bytes at a time and sets a
+// trailer of its request at each read, as a caller that sends a running
+// checksum does.
+type eager struct {
+	req  *http.Request
+	left int
+}
+
+func (b *eager) Read(into []byte) (int, error) {
+	b.req.Trailer.Set("X-Checksum", "so far")
+
+	if b.left == 0 {
+		return 0, io.EOF
+	}
+
+	time.Sleep(time.Millisecond)
+
+	read := min(len(into), b.left, 16)
+	for index := range read {
+		into[index] = 'x'
+	}
+
+	b.left -= read
+
+	return read, nil
+}
+
+func (*eager) Close() error { return nil }
+
+// TestTheTrailerIsNotReadOnceTheRequestIsSent: a server that answers before
+// it has read the request leaves net/http's transport reading the body, and
+// the body writing the Trailer, after RoundTrip has returned. Nothing here
+// reads the Trailer then: the request gets its one attempt, and the race
+// detector finds nothing.
+func TestTheTrailerIsNotReadOnceTheRequestIsSent(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+
+		// Before any of the body is read: the client is still sending it.
+		control := http.NewResponseController(w)
+		_ = control.EnableFullDuplex()
+
+		w.WriteHeader(http.StatusServiceUnavailable)
+
+		_ = control.Flush()
+	}))
+	t.Cleanup(server.Close)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, server.URL, http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req.Trailer = http.Header{"X-Checksum": nil}
+
+	// 64 reads of a millisecond each: far longer than the answer takes.
+	body := func() (io.ReadCloser, error) { return &eager{req: req, left: 1024}, nil }
+
+	req.Body, _ = body()
+	req.GetBody = body
+	req.ContentLength = -1
+
+	standard := &http.Transport{}
+	t.Cleanup(standard.CloseIdleConnections)
+
+	resp, err := retry.NewTransport(standard, quick(3)).RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable || requests.Load() != 1 {
+		t.Errorf("status %d after %d requests; want the 503 after 1", resp.StatusCode, requests.Load())
+	}
+}
+
+// TestWhatMakesARequestOneThatIsSentOnce: of a PUT that is answered 503,
+// what its body and its trailers make of it.
+func TestWhatMakesARequestOneThatIsSentOnce(t *testing.T) {
+	t.Parallel()
+
+	for name, made := range map[string]struct {
+		edit     func(*http.Request)
+		attempts int
+	}{
+		"a body in memory":                {func(*http.Request) {}, 2},
+		"no body":                         {func(req *http.Request) { req.Body, req.GetBody = nil, nil }, 2},
+		"http.NoBody":                     {func(req *http.Request) { req.Body, req.GetBody = http.NoBody, nil }, 2},
+		"a stream":                        {func(req *http.Request) { req.GetBody = nil }, 1},
+		"trailers":                        {func(req *http.Request) { req.Trailer = http.Header{"X-Checksum": nil} }, 1},
+		"trailers and no body":            {func(req *http.Request) { req.Body, req.Trailer = nil, http.Header{"X-Checksum": nil} }, 1},
+		"a Trailer that declares nothing": {func(req *http.Request) { req.Trailer = http.Header{} }, 1},
+	} {
+		req, err := http.NewRequestWithContext(
+			t.Context(),
+			http.MethodPut,
+			"https://server.test/",
+			strings.NewReader("content"),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		made.edit(req)
+
+		base := &scripted{script: failing(1, answer{status: http.StatusServiceUnavailable})}
+
+		resp, err := retry.NewTransport(base, quick(1)).RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_ = resp.Body.Close()
+
+		if len(base.attempts()) != made.attempts {
+			t.Errorf("%s: %d attempts, want %d", name, len(base.attempts()), made.attempts)
 		}
 	}
+}
+
+// TestOneTransportCarriesManyRequestsAtOnce: every request through one
+// transport, from many goroutines at once, gets its own retry and its own
+// answer. The race detector reads the rest.
+func TestOneTransportCarriesManyRequestsAtOnce(t *testing.T) {
+	t.Parallel()
+
+	const callers = 64
+
+	var (
+		mu       sync.Mutex
+		attempts = map[string]int{}
+	)
+
+	base := roundTripper(func(req *http.Request) (*http.Response, error) {
+		caller := req.Header.Get("X-Caller")
+
+		mu.Lock()
+		attempts[caller]++
+		first := attempts[caller] == 1
+		mu.Unlock()
+
+		status := http.StatusOK
+		if first {
+			status = http.StatusServiceUnavailable
+		}
+
+		return &http.Response{
+			StatusCode: status,
+			Header:     http.Header{"X-Caller": {caller}},
+			Body:       http.NoBody,
+			Request:    req,
+		}, nil
+	})
+
+	transport := retry.NewTransport(base, quick(1))
+
+	var group sync.WaitGroup
+
+	for caller := range callers {
+		group.Go(func() {
+			name := strconv.Itoa(caller)
+
+			req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://server.test/", http.NoBody)
+			if err != nil {
+				t.Error(err)
+
+				return
+			}
+
+			req.Header.Set("X-Caller", name)
+
+			resp, err := transport.RoundTrip(req)
+			if err != nil {
+				t.Error(err)
+
+				return
+			}
+
+			_ = resp.Body.Close()
+
+			mu.Lock()
+			sent := attempts[name]
+			mu.Unlock()
+
+			if resp.StatusCode != http.StatusOK || resp.Header.Get("X-Caller") != name || resp.Request != req ||
+				sent != 2 {
+				t.Errorf("caller %s: %d for caller %q after %d attempts; want its own 200 after 2",
+					name, resp.StatusCode, resp.Header.Get("X-Caller"), sent)
+			}
+		})
+	}
+
+	group.Wait()
 }
