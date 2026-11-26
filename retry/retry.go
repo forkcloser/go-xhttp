@@ -1,9 +1,3 @@
-// Copyright Mycophonic.
-// Copyright Forkcloser.
-//
-// Use of this source code is governed by the MIT license that can be
-// found in the LICENSE file.
-
 package retry
 
 import (
@@ -20,15 +14,6 @@ import (
 	"time"
 
 	"github.com/forkcloser/xhttp"
-)
-
-const (
-	// DefaultBackoff is the wait before the first retry under Options that
-	// name no Backoff.
-	DefaultBackoff = 500 * time.Millisecond
-	// DefaultMaxBackoff is the longest wait before a retry under Options
-	// that name no MaxBackoff.
-	DefaultMaxBackoff = 30 * time.Second
 )
 
 // drainLimit is how much of a response given up on is read before it is
