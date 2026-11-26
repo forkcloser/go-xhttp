@@ -10,12 +10,14 @@ package xhttp_test
 //     transport is made;
 //   - Offline fails every request with ErrOffline, and nothing is dialed;
 //   - a request the posture refuses has its body closed, as RoundTrip must;
-//   - a request whose response has not begun StallTimeout after it was
-//     sent fails with ErrStalled, as does a read of a response body that
-//     waits that long for a byte, over HTTP/1 and HTTP/2, and with neither
+//   - a request whose body the server stops taking for StallTimeout fails
+//     with ErrStalled; so does one whose response has not begun that long
+//     after it was sent, and a read of a response body that waits that long
+//     for a byte; over HTTP/1 and HTTP/2, and with neither
 //     of the context's errors, since nothing of the caller's ended; an
-//     error of that body afterwards is its own; the time between
-//     two reads is not counted; a negative StallTimeout waits for ever; a
+//     error of that body afterwards is its own; the caller's time is not
+//     counted, in a read of the request's body or between two reads of the
+//     response's; a negative StallTimeout waits for ever; a
 //     Close from another goroutine ends a read; the connection a protocol
 //     switch hands over is not watched;
 //   - a response body read to its end holds nothing of the request any
@@ -56,6 +58,7 @@ package xhttp_test
 // http.DefaultTransport shows in nothing a caller can see.
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -470,6 +473,10 @@ func TestAResponseThatDoesNotBegin(t *testing.T) {
 				t.Errorf("%s: %v, want ErrStalled and no error of a context", path, err)
 			}
 
+			if err != nil && !strings.Contains(err.Error(), "no response began") {
+				t.Errorf("%s: %v does not say the request was sent and not answered", path, err)
+			}
+
 			// A timer never fires early.
 			if waited := time.Since(started); waited < stall {
 				t.Errorf("%s: failed after %v, before the %v of the limit", path, waited, stall)
@@ -485,25 +492,227 @@ func TestAResponseThatDoesNotBegin(t *testing.T) {
 	})
 }
 
-// lingering is a request body whose one read takes a while.
+// lingering is a request body each of whose reads takes a while: one read,
+// or as many as pieces says.
 type lingering struct {
-	wait time.Duration
-	done bool
+	wait   time.Duration
+	pieces int
+	given  int
 }
 
 func (b *lingering) Read(into []byte) (int, error) {
-	if b.done {
+	if b.given >= max(b.pieces, 1) {
 		return 0, io.EOF
 	}
 
 	time.Sleep(b.wait)
 
-	b.done = true
+	b.given++
 
 	return copy(into, "content"), nil
 }
 
 func (*lingering) Close() error { return nil }
+
+// endless is a request body that never ends.
+type endless struct{}
+
+func (endless) Read(into []byte) (int, error) { return len(into), nil }
+
+func (endless) Close() error { return nil }
+
+// TestARequestTheServerStopsTaking: a server that reads none of a request's
+// body fails the request with ErrStalled once StallTimeout has passed, and
+// with neither of the context's errors. The time the caller's body takes to
+// give its content is not the server's, and is not counted.
+func TestARequestTheServerStopsTaking(t *testing.T) {
+	t.Parallel()
+
+	const stall = 300 * time.Millisecond
+
+	versions(t, func(t *testing.T, _ int, serve func(http.Handler) (string, xhttp.Config)) {
+		t.Helper()
+
+		release := make(chan struct{})
+
+		address, config := serve(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/reads" {
+				_, _ = io.Copy(io.Discard, r.Body)
+
+				return
+			}
+
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		}))
+
+		t.Cleanup(func() { close(release) })
+
+		config.StallTimeout = stall
+		transport := xhttp.NewTransport(config)
+
+		// Far past the limit: what ends a request the limit did not.
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+
+		put := func(path string, body io.ReadCloser) (int, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodPut, address+path, body)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			resp, err := transport.RoundTrip(req)
+			if err != nil {
+				return 0, err
+			}
+
+			_ = resp.Body.Close()
+
+			return resp.StatusCode, nil
+		}
+
+		started := time.Now()
+
+		_, err := put("/deaf", endless{})
+		if !errors.Is(err, xhttp.ErrStalled) || errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("a body the server reads none of: %v, want ErrStalled and no error of a context", err)
+		}
+
+		if err != nil && !strings.Contains(err.Error(), "stopped taking the request") {
+			t.Errorf("a body the server reads none of: %v does not say the request was not taken", err)
+		}
+
+		// A timer never fires early.
+		if waited := time.Since(started); waited < stall {
+			t.Errorf("a body the server reads none of: failed after %v, before the %v of the limit", waited, stall)
+		}
+
+		// Two reads of twice the limit each: the second while the server
+		// has had the first for longer than the limit.
+		if status, err := put("/reads", &lingering{wait: 2 * stall, pieces: 2}); err != nil || status != http.StatusOK {
+			t.Errorf("a body that takes its time, to a server that reads it: %d, %v; want 200", status, err)
+		}
+	})
+}
+
+// answeringEachConnection is the address of a listener that hands each
+// connection it accepts to answer, and closes it after.
+func answeringEachConnection(t *testing.T, answer func(net.Conn)) string {
+	t.Helper()
+
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = listener.Close() })
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+
+			go func() {
+				defer func() { _ = conn.Close() }()
+
+				_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+				answer(conn)
+			}()
+		}
+	}()
+
+	return listener.Addr().String()
+}
+
+// TestTheBodyNetHTTPTakesAgainIsReadThroughTheWaitToo: when a connection of
+// its pool turns out closed, net/http sends the request a second time
+// itself, with a body it takes from GetBody. That body's reads are still the
+// caller's time: three of twice the limit each, and the request is answered.
+func TestTheBodyNetHTTPTakesAgainIsReadThroughTheWaitToo(t *testing.T) {
+	t.Parallel()
+
+	const stall = 150 * time.Millisecond
+
+	var connections atomic.Int32
+
+	// The first connection answers one request, reads the next whole and
+	// hangs up on it; every other answers the request it is sent.
+	address := "http://" + answeringEachConnection(t, func(conn net.Conn) {
+		first := connections.Add(1) == 1
+		reader := bufio.NewReader(conn)
+
+		request, err := http.ReadRequest(reader)
+		if err != nil {
+			return
+		}
+
+		_, _ = io.Copy(io.Discard, request.Body)
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+
+		if !first {
+			return
+		}
+
+		if unanswered, err := http.ReadRequest(reader); err == nil {
+			_, _ = io.Copy(io.Discard, unanswered.Body)
+		}
+	})
+
+	transport := xhttp.NewTransport(xhttp.Config{Cleartext: true, StallTimeout: stall})
+
+	// One request, so that the next travels on a connection of the pool.
+	warm, err := http.NewRequestWithContext(t.Context(), http.MethodGet, address, http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := transport.RoundTrip(warm)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	req, err := http.NewRequestWithContext(
+		t.Context(),
+		http.MethodPut,
+		address,
+		io.NopCloser(strings.NewReader("content")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// What makes net/http send a PUT again by itself.
+	req.Header.Set("Idempotency-Key", "one")
+	req.ContentLength = -1
+
+	taken := 0
+	req.GetBody = func() (io.ReadCloser, error) {
+		taken++
+
+		return &lingering{wait: 2 * stall, pieces: 3}, nil
+	}
+
+	resp, err = transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("%v after %d connections, the body taken again %d times; want 200", err, connections.Load(), taken)
+	}
+
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK || connections.Load() != 2 || taken != 1 {
+		t.Errorf("status %d after %d connections, the body taken again %d times; want 200 after 2 and once",
+			resp.StatusCode, connections.Load(), taken)
+	}
+}
 
 // TestAnAnswerEndsTheWaitForIt: a server may answer before it has the whole
 // request, and net/http then finishes sending the request on its own. The

@@ -14,9 +14,10 @@
 //     or not at all ([HybridOnly]). [Classical] and [Legacy] give that up for
 //     every connection of the transport that names them, and for no other: a
 //     program that needs two levels makes two transports;
-//   - fails with [ErrStalled] a request whose response has not begun a
-//     minute after it was sent, and the read of a response body that waits a
-//     minute for a byte ([Config.StallTimeout]);
+//   - fails with [ErrStalled] an exchange the server leaves waiting for a
+//     minute: a request it has stopped taking, one whose response has not
+//     begun, and the read of a response body that gets no byte
+//     ([Config.StallTimeout]);
 //   - waits 30 seconds for a connection and 10 for the TLS handshake, and
 //     closes an HTTP/2 connection that answers no ping. The exchange as a
 //     whole has no limit but the request's context;
@@ -39,9 +40,9 @@
 //   - [ErrHandshakeRefused]: the server answered with a TLS alert. No retry
 //     changes that; a weaker [KeyExchange] may, when the alert is for what
 //     the transport offered and not for the client's certificate.
-//   - [ErrStalled]: the server went silent, before its response or in the
-//     middle of its body. What was read of a body is the caller's, and so is
-//     asking for the rest.
+//   - [ErrStalled]: the server went silent, in the middle of the request,
+//     before its response, or in the middle of its body. What was read of a
+//     body is the caller's, and so is asking for the rest.
 //   - [ErrRedirect]: a redirect was not followed.
 //   - [ErrCredential]: [NewCredential] was given what would not arrive as
 //     it is, or could never match. Fix the argument the error names.

@@ -126,16 +126,7 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	awaited := await(cancel, t.stall)
 	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: awaited.sent})
 
-	// A RoundTripper leaves the caller's request as it is. Not Request.Clone:
-	// it copies Trailer, which a caller fills while the body is read.
-	sent := req.WithContext(ctx)
-
-	if _, named := req.Header["User-Agent"]; t.userAgent != "" && !named {
-		sent.Header = req.Header.Clone()
-		sent.Header.Set("User-Agent", t.userAgent)
-	}
-
-	resp, err := t.base.RoundTrip(sent)
+	resp, err := t.base.RoundTrip(t.outgoing(ctx, req, awaited))
 
 	awaited.answered()
 
@@ -146,7 +137,7 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		// that is the context's error, of a context that is not the
 		// caller's.
 		if errors.Is(context.Cause(ctx), ErrStalled) {
-			return nil, fmt.Errorf("%w: the request was sent, and no response began", ErrStalled)
+			return nil, awaited.stalled()
 		}
 
 		return nil, refused(err)
@@ -175,6 +166,38 @@ func (t *transport) CloseIdleConnections() {
 	t.base.CloseIdleConnections()
 }
 
+// outgoing is req as it is sent: under ctx, with the transport's User-Agent
+// when it has none, and its body read through the wait for the server.
+func (t *transport) outgoing(ctx context.Context, req *http.Request, awaited *awaiting) *http.Request {
+	// A RoundTripper leaves the caller's request as it is. Not Request.Clone:
+	// it copies Trailer, which a caller fills while the body is read.
+	sent := req.WithContext(ctx)
+
+	if req.Body != nil && req.Body != http.NoBody {
+		sent.Body = &sentBody{ReadCloser: req.Body, awaited: awaited}
+	}
+
+	// net/http takes the body again from here when it sends a request a
+	// second time, on a connection of its pool that turned out closed.
+	if req.GetBody != nil {
+		sent.GetBody = func() (io.ReadCloser, error) {
+			body, err := req.GetBody()
+			if err != nil {
+				return nil, err //nolint:wrapcheck // the caller's own function, and its error unchanged
+			}
+
+			return &sentBody{ReadCloser: body, awaited: awaited}, nil
+		}
+	}
+
+	if _, named := req.Header["User-Agent"]; t.userAgent != "" && !named {
+		sent.Header = req.Header.Clone()
+		sent.Header.Set("User-Agent", t.userAgent)
+	}
+
+	return sent
+}
+
 // closeBody is the part of a RoundTripper's contract that holds on a request
 // it refuses: the body is closed all the same.
 func closeBody(req *http.Request) {
@@ -193,13 +216,16 @@ func refused(err error) error {
 	return err
 }
 
-// awaiting fails a request whose response does not begin within limit of the
-// request having been sent. A limit of zero waits for ever.
+// awaiting fails a request the server leaves waiting for longer than limit:
+// for it to take the part of the request's body that was just read, then for
+// its response to begin. A limit of zero waits for ever.
 type awaiting struct {
 	limit time.Duration
 
 	mu    sync.Mutex
 	timer *time.Timer
+	// whole is set once the request is written whole.
+	whole bool
 	// over is set once RoundTrip has its answer: net/http may still be
 	// writing the request then, and what it reports is no longer waited on.
 	over bool
@@ -212,15 +238,64 @@ func await(cancel context.CancelCauseFunc, limit time.Duration) *awaiting {
 	return &awaiting{limit: limit, timer: timer}
 }
 
-// sent is httptrace's WroteRequest: the request is written, or could not be,
-// and the wait for the response starts.
-func (a *awaiting) sent(httptrace.WroteRequestInfo) {
+// arm starts the wait, or starts it again: the next move is the server's.
+func (a *awaiting) arm() {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
 	if a.limit != 0 && !a.over {
 		a.timer.Reset(a.limit)
 	}
+}
+
+// hold suspends the wait: the next move is the caller's.
+func (a *awaiting) hold() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.timer.Stop()
+}
+
+// sent is httptrace's WroteRequest: the request is written, or could not be,
+// and the wait for the response starts.
+func (a *awaiting) sent(written httptrace.WroteRequestInfo) {
+	a.mu.Lock()
+	a.whole = written.Err == nil
+	a.mu.Unlock()
+
+	a.arm()
+}
+
+// stalled is the error of a request the wait has ended.
+func (a *awaiting) stalled() error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.whole {
+		return fmt.Errorf("%w: the request was sent, and no response began", ErrStalled)
+	}
+
+	return fmt.Errorf("%w: the server stopped taking the request", ErrStalled)
+}
+
+// sentBody is a request's body as the transport under this one reads it. The
+// time a read takes is the caller's, to produce what it sends, and is not
+// counted; the time between two reads is the server's, to take what was
+// read, and is.
+type sentBody struct {
+	io.ReadCloser
+
+	awaited *awaiting
+}
+
+func (b *sentBody) Read(into []byte) (int, error) {
+	b.awaited.hold()
+
+	read, err := b.ReadCloser.Read(into)
+
+	b.awaited.arm()
+
+	return read, err //nolint:wrapcheck // the caller's own body, and its error unchanged
 }
 
 // answered ends the wait: the response began, or the request failed.

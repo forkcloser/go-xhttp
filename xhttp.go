@@ -20,12 +20,14 @@ type Config struct {
 	Certificates []tls.Certificate
 	// Proxy picks a request's proxy; http.ProxyFromEnvironment when nil.
 	Proxy func(*http.Request) (*url.URL, error)
-	// StallTimeout is how long the server may stay silent: before its
-	// response begins, once the request is sent, and then while a read of
-	// the response's body waits for a byte. Past it the request, or the
-	// read, fails with [ErrStalled]. The time a caller takes between two
-	// reads is its own and is not counted. Zero is one minute; a negative
-	// value waits for ever, with the request's context as the one limit.
+	// StallTimeout is how long the server may stay silent: before it takes
+	// more of the request's body, before its response begins once the
+	// request is sent, and then while a read of the response's body waits
+	// for a byte. Past it the request, or the read,
+	// fails with [ErrStalled]. The caller's own time is not counted: what
+	// its request body takes to give its content, and what it takes between
+	// two reads of the response. Zero is one minute; a negative value waits
+	// for ever, with the request's context as the one limit.
 	StallTimeout time.Duration
 	// UserAgent is the User-Agent of a request that has no such header;
 	// Go's own when empty.

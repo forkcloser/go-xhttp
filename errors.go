@@ -15,8 +15,9 @@ var (
 	// client's side of the handshake is done.
 	ErrHandshakeRefused = errors.New("the server refused the TLS handshake")
 	// ErrStalled is the error of a server that stayed silent for longer than
-	// [Config.StallTimeout]: its response did not begin once the request was
-	// sent, or the response's body stopped arriving.
+	// [Config.StallTimeout]: it stopped taking the request, its response did
+	// not begin once the request was sent, or the response's body stopped
+	// arriving.
 	ErrStalled = errors.New("the server went silent")
 	// ErrRedirect is the error of a redirect the client does not follow.
 	ErrRedirect = errors.New("redirect refused")
