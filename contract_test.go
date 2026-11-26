@@ -6,26 +6,51 @@ package xhttp_test
 //     for by name: a request that is not https fails with ErrCleartext unless
 //     Cleartext; a server with no post-quantum hybrid key exchange, or no TLS
 //     1.3, fails the handshake with ErrHandshakeRefused unless the transport
-//     names Classical or Legacy; a level there is none of panics when the
+//     names Classical or Legacy, whether it says so with an alert (RFC 8446,
+//     4.1.1: "the server MUST abort the handshake with a handshake_failure
+//     or an insufficient_security alert") or answers in TLS 1.2 and leaves
+//     this side to end the handshake (appendix D.1: "If the server does not
+//     support TLS 1.3, it will respond with a ServerHello containing an
+//     older version number"); a level there is none of panics when the
 //     transport is made;
+//   - ErrHandshakeRefused is a handshake that failed for another reason than
+//     the server's certificate or the network: not a certificate that is not
+//     trusted, not a connection closed in the middle of the handshake, and
+//     not what a server says once the handshake is done;
 //   - Offline fails every request with ErrOffline, and nothing is dialed;
 //   - a request the posture refuses has its body closed, as RoundTrip must;
-//   - a read of a response body that waits longer than StallTimeout for a
-//     byte fails with ErrStalled, over HTTP/1 and HTTP/2; the time between
-//     two reads is not counted; a negative StallTimeout waits for ever; a
+//   - a request whose body the server stops taking for StallTimeout fails
+//     with ErrStalled; so does one whose response has not begun that long
+//     after it was sent, and a read of a response body that waits that long
+//     for a byte; over HTTP/1 and HTTP/2, and with neither
+//     of the context's errors, since nothing of the caller's ended; an
+//     error of that body afterwards is its own; the caller's time is not
+//     counted, in a read of the request's body or between two reads of the
+//     response's; a negative StallTimeout waits for ever; a
 //     Close from another goroutine ends a read; the connection a protocol
 //     switch hands over is not watched;
+//   - a response body read to its end holds nothing of the request any
+//     more, closed or not, as under net/http's own transport (net/http,
+//     Response.Body: "It is the caller's responsibility to close Body", and
+//     its transport lets go of the request at the body's end all the same);
 //   - the caller's request is left as it was, and is the response's Request;
 //     a trailer the caller sets while the body is read is sent;
-//   - UserAgent is the User-Agent of a request that has no such header;
+//   - UserAgent is the User-Agent of a request that has no such header, and
+//     of the CONNECT net/http sends a proxy for a tunnel;
+//   - a request's proxy is Config.Proxy's, or the environment's as net/http
+//     reads it (http.ProxyFromEnvironment); a proxy whose URL holds
+//     credentials is reached over https only, unless Cleartext: net/http
+//     sends them as a Proxy-Authorization header (RFC 9110, 11.7.2) to an
+//     http proxy, and as they are to a SOCKS5 one (RFC 1929), and the
+//     request fails with ErrCleartext before anything is dialed;
 //   - a Credential is made by NewCredential from a scheme that is an HTTP
 //     token (RFC 9110, 5.6.2 and 11.1), a token that net/http sends as it
 //     is in a header field (5.5: any octet but a control character other
-//     than a tab, and nothing blank at an end), and one host or more, each written in ASCII as a URL writes it
-//     (RFC 3986, 3.2.2: a name, an IPv4 address or an IPv6 address in
-//     brackets, alone or with a port; no zone, which RFC 6874 writes one
-//     way and net/url gives back another). Anything else is ErrCredential,
-//     and the error does not hold the token;
+//     than a tab, and nothing blank at an end), and one host or more, each
+//     written in ASCII as a URL writes it (RFC 3986, 3.2.2: a name, an IPv4
+//     address or an IPv6 address in brackets, alone or with a port; no zone,
+//     which RFC 6874 writes one way and net/url gives back another).
+//     Anything else is ErrCredential, and the error does not hold the token;
 //   - a credential goes with a request exactly when the request is https,
 //     its URL writes its host in ASCII, and net/http dials for it the
 //     address it dials for one of the credential's hosts over https: so not
@@ -41,14 +66,17 @@ package xhttp_test
 //     token: under every verb of fmt, where fmt asks the value (fmt:
 //     Formatter) and where it reads the fields itself (a value in an
 //     unexported field), and so through log/slog and encoding/json;
-//   - Redirects follows at most its limit, and none from https to anything
-//     else: both are ErrRedirect;
-//   - an error that is not the posture's is the standard library's, unchanged.
+//   - no transport carries a request that a redirect leads to from https
+//     to another scheme, whatever client follows it and whatever Cleartext
+//     says (net/http, Request.Response: "the redirect response which caused
+//     this request to be created"); a client from NewClient follows ten
+//     redirects and no more; both are ErrRedirect;
+//   - an error that is not the posture's is the standard library's, unchanged;
+//   - a transport is safe for concurrent use (net/http: "A RoundTripper must
+//     be safe for concurrent use by multiple goroutines").
 //
-// That nothing reads or writes a global has no test: a read of
-// http.DefaultTransport shows in nothing a caller can see.
-
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"crypto/x509"
@@ -58,7 +86,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -208,7 +238,7 @@ func TestARefusedRequestHasItsBodyClosed(t *testing.T) {
 func TestUnknownLevelPanics(t *testing.T) {
 	t.Parallel()
 
-	for _, level := range []xhttp.KeyExchange{-1, xhttp.Legacy + 1} {
+	for _, level := range []xhttp.TLSLevel{-1, xhttp.Legacy + 1} {
 		for name, build := range map[string]func(xhttp.Config){
 			"NewTransport": func(config xhttp.Config) { xhttp.NewTransport(config) },
 			"NewClient":    func(config xhttp.Config) { xhttp.NewClient(config) },
@@ -220,7 +250,7 @@ func TestUnknownLevelPanics(t *testing.T) {
 					}
 				}()
 
-				build(xhttp.Config{KeyExchange: level})
+				build(xhttp.Config{TLS: level})
 			}()
 		}
 	}
@@ -240,6 +270,195 @@ func TestARefusedHandshakeKeepsItsCause(t *testing.T) {
 
 	if alert, found := errors.AsType[*net.OpError](err); !found || alert.Op != "remote error" {
 		t.Fatalf("the server's alert is not in the chain of %v", err)
+	}
+}
+
+// answeringInTLS12 is the address of a server that answers every ClientHello
+// as a stack from before TLS 1.3 does: it knows nothing of the extension
+// that offers TLS 1.3, reads the TLS 1.2 the hello also carries, and answers
+// with a TLS 1.2 ServerHello. It sends no alert.
+func answeringInTLS12(t *testing.T) string {
+	t.Helper()
+
+	return "https://" + answeringEachConnection(t, func(conn net.Conn) {
+		// The record that carries the ClientHello: five bytes, the last
+		// two its length.
+		header := make([]byte, 5)
+		if _, err := io.ReadFull(conn, header); err != nil {
+			return
+		}
+
+		if _, err := io.CopyN(io.Discard, conn, int64(header[3])<<8|int64(header[4])); err != nil {
+			return
+		}
+
+		hello := []byte{0x03, 0x03} // TLS 1.2
+
+		// The random, which is not the one a TLS 1.3 server signals a
+		// downgrade with.
+		for index := range 32 {
+			hello = append(hello, byte(index+1))
+		}
+
+		hello = append(hello,
+			0x00,       // no session
+			0xc0, 0x2f, // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+			0x00, // no compression
+		)
+
+		handshake := append([]byte{0x02, 0x00, 0x00, byte(len(hello))}, hello...)
+
+		_, _ = conn.Write(append([]byte{0x16, 0x03, 0x03, 0x00, byte(len(handshake))}, handshake...))
+
+		// Whatever the client answers, until it hangs up.
+		_, _ = io.Copy(io.Discard, conn)
+	})
+}
+
+// answeringEachConnection is the address of a listener that hands each
+// connection it accepts to answer, and closes it after.
+func answeringEachConnection(t *testing.T, answer func(net.Conn)) string {
+	t.Helper()
+
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = listener.Close() })
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+
+			go func() {
+				defer func() { _ = conn.Close() }()
+
+				_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+				answer(conn)
+			}()
+		}
+	}()
+
+	return listener.Addr().String()
+}
+
+// TestWhatARefusedHandshakeIs: a handshake that fails is ErrHandshakeRefused
+// by where it failed and for what, and not by how the failure is typed.
+func TestWhatARefusedHandshakeIs(t *testing.T) {
+	t.Parallel()
+
+	plain := httptest.NewServer(http.HandlerFunc(ok))
+	t.Cleanup(plain.Close)
+
+	untrusted := httptest.NewTLSServer(http.HandlerFunc(ok))
+	t.Cleanup(untrusted.Close)
+
+	// With TLS 1.3 a server turns a client down for its certificate once
+	// the client's side of the handshake is done.
+	demanding, demandingRoots := secure(
+		t,
+		ok,
+		func(config *tls.Config) { config.ClientAuth = tls.RequireAnyClientCert },
+	)
+
+	// With the hello unread, which resets the connection, and with it read,
+	// which ends it.
+	resetting := "https://" + answeringEachConnection(t, func(conn net.Conn) {
+		_, _ = conn.Read(make([]byte, 1))
+	})
+	ending := "https://" + answeringEachConnection(t, func(conn net.Conn) {
+		header := make([]byte, 5)
+		if _, err := io.ReadFull(conn, header); err == nil {
+			_, _ = io.CopyN(io.Discard, conn, int64(header[3])<<8|int64(header[4]))
+		}
+	})
+	silent := "https://" + answeringEachConnection(t, func(conn net.Conn) {
+		_, _ = io.Copy(io.Discard, conn)
+	})
+
+	// A record of TLS 1.2 that is cut after three bytes, and one that is
+	// whole and empty, which this side turns down with an alert of its own.
+	answeringWith := func(record ...byte) string {
+		return "https://" + answeringEachConnection(t, func(conn net.Conn) {
+			header := make([]byte, 5)
+			if _, err := io.ReadFull(conn, header); err != nil {
+				return
+			}
+
+			if _, err := io.CopyN(io.Discard, conn, int64(header[3])<<8|int64(header[4])); err != nil {
+				return
+			}
+
+			_, _ = conn.Write(record)
+		})
+	}
+
+	// Shorter than the ten seconds a handshake is given.
+	soon, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+
+	for name, server := range map[string]struct {
+		ctx     context.Context //nolint:containedctx // one case of the table has a deadline
+		address string
+		config  xhttp.Config
+		refused bool
+	}{
+		"a server that answers in TLS 1.2, at HybridOnly": {
+			t.Context(), answeringInTLS12(t), xhttp.Config{}, true,
+		},
+		"a server that answers in TLS 1.2, at Classical": {
+			t.Context(), answeringInTLS12(t), xhttp.Config{TLS: xhttp.Classical}, true,
+		},
+		"a server that does not speak TLS": {
+			t.Context(), "https://" + strings.TrimPrefix(plain.URL, "http://"), xhttp.Config{}, true,
+		},
+		"a server whose answer is a handshake record with nothing in it": {
+			t.Context(), answeringWith(0x16, 0x03, 0x03, 0x00, 0x00), xhttp.Config{}, true,
+		},
+		"a server that ends the connection in the middle of its answer": {
+			t.Context(), answeringWith(0x16, 0x03, 0x03), xhttp.Config{}, false,
+		},
+		"a server that resets the connection on the ClientHello": {t.Context(), resetting, xhttp.Config{}, false},
+		"a server that ends the connection on the ClientHello":   {t.Context(), ending, xhttp.Config{}, false},
+		"a context that ends in the middle of the handshake":     {soon, silent, xhttp.Config{}, false},
+		"a certificate that is not trusted":                      {t.Context(), untrusted.URL, xhttp.Config{}, false},
+		"a server that wants a client certificate, in TLS 1.3": {
+			t.Context(), demanding.URL, xhttp.Config{Roots: demandingRoots}, false,
+		},
+	} {
+		_, err := get(server.ctx, t, xhttp.NewClient(server.config), server.address)
+		if err == nil || errors.Is(err, xhttp.ErrHandshakeRefused) != server.refused {
+			t.Errorf("%s: %v; ErrHandshakeRefused: %t, want %t", name, err, !server.refused, server.refused)
+		}
+	}
+}
+
+// TestAHandshakeTheServerNeverAnswers: the ten seconds a handshake is given
+// end it with net/http's own error, a timeout, which is the network's and
+// no refusal. It takes those ten seconds.
+func TestAHandshakeTheServerNeverAnswers(t *testing.T) {
+	t.Parallel()
+
+	silent := "https://" + answeringEachConnection(t, func(conn net.Conn) {
+		_, _ = io.Copy(io.Discard, conn)
+	})
+
+	started := time.Now()
+
+	_, err := get(t.Context(), t, xhttp.NewClient(xhttp.Config{}), silent)
+
+	timed, found := errors.AsType[net.Error](err)
+	if !found || !timed.Timeout() || errors.Is(err, xhttp.ErrHandshakeRefused) {
+		t.Errorf("%v, want a timeout that is no ErrHandshakeRefused", err)
+	}
+
+	if waited := time.Since(started); waited < 10*time.Second || waited > 25*time.Second {
+		t.Errorf("the handshake was given %v, want ten seconds", waited)
 	}
 }
 
@@ -373,10 +592,24 @@ func TestStalledBody(t *testing.T) {
 		stopped := open(t, client, address+"/stops", major)
 
 		content, err := io.ReadAll(stopped.Body)
-		_ = stopped.Body.Close()
 
 		if !errors.Is(err, xhttp.ErrStalled) || string(content) != "first" {
 			t.Errorf("a body that stops: read %q, %v; want what arrived and ErrStalled", content, err)
+		}
+
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("a body that stops: %v is also a context's error, and no context of the caller's ended", err)
+		}
+
+		if _, again := stopped.Body.Read(make([]byte, 1)); !errors.Is(again, xhttp.ErrStalled) ||
+			errors.Is(again, context.Canceled) {
+			t.Errorf("a second read of a stalled body: %v, want ErrStalled alone", again)
+		}
+
+		_ = stopped.Body.Close()
+
+		if _, closed := stopped.Body.Read(make([]byte, 1)); closed == nil || errors.Is(closed, xhttp.ErrStalled) {
+			t.Errorf("a read of a stalled body after its Close: %v, want the error of a closed body", closed)
 		}
 
 		paused := open(t, client, address+"/paused", major)
@@ -400,37 +633,415 @@ func TestStalledBody(t *testing.T) {
 	})
 }
 
+// TestAResponseThatDoesNotBegin: a server that takes a request and says
+// nothing fails it with ErrStalled once StallTimeout has passed, and with
+// neither of the context's errors; under a negative StallTimeout it is
+// waited for.
+func TestAResponseThatDoesNotBegin(t *testing.T) {
+	t.Parallel()
+
+	const stall = 200 * time.Millisecond
+
+	versions(t, func(t *testing.T, _ int, serve func(http.Handler) (string, xhttp.Config)) {
+		t.Helper()
+
+		release := make(chan struct{})
+
+		address, config := serve(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			wait := release
+			if r.URL.Path == "/late" {
+				wait = nil
+			}
+
+			select {
+			case <-wait:
+			case <-time.After(3 * stall):
+				if wait == nil {
+					_, _ = w.Write([]byte("content"))
+				}
+			case <-r.Context().Done():
+			}
+		}))
+
+		t.Cleanup(func() { close(release) })
+
+		config.StallTimeout = stall
+		limited := xhttp.NewClient(config)
+
+		// Far past the limit: what ends a request the limit did not.
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+
+		for _, path := range []string{"/never", "/late"} {
+			started := time.Now()
+
+			_, err := get(ctx, t, limited, address+path)
+			if !errors.Is(err, xhttp.ErrStalled) || errors.Is(err, context.Canceled) ||
+				errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("%s: %v, want ErrStalled and no error of a context", path, err)
+			}
+
+			if err != nil && !strings.Contains(err.Error(), "no response began") {
+				t.Errorf("%s: %v does not say the request was sent and not answered", path, err)
+			}
+
+			// A timer never fires early.
+			if waited := time.Since(started); waited < stall {
+				t.Errorf("%s: failed after %v, before the %v of the limit", path, waited, stall)
+			}
+		}
+
+		config.StallTimeout = -1
+
+		if status, err := get(t.Context(), t, xhttp.NewClient(config), address+"/late"); err != nil ||
+			status != http.StatusOK {
+			t.Errorf("with no limit, a response that begins late: %d, %v; want 200", status, err)
+		}
+	})
+}
+
+// lingering is a request body each of whose reads takes a while: one read,
+// or as many as pieces says.
+type lingering struct {
+	wait   time.Duration
+	pieces int
+	given  int
+}
+
+func (b *lingering) Read(into []byte) (int, error) {
+	if b.given >= max(b.pieces, 1) {
+		return 0, io.EOF
+	}
+
+	time.Sleep(b.wait)
+
+	b.given++
+
+	return copy(into, "content"), nil
+}
+
+func (*lingering) Close() error { return nil }
+
+// endless is a request body that never ends.
+type endless struct{}
+
+func (endless) Read(into []byte) (int, error) { return len(into), nil }
+
+func (endless) Close() error { return nil }
+
+// TestARequestTheServerStopsTaking: a server that reads none of a request's
+// body fails the request with ErrStalled once StallTimeout has passed, and
+// with neither of the context's errors. The time the caller's body takes to
+// give its content is not the server's, and is not counted.
+func TestARequestTheServerStopsTaking(t *testing.T) {
+	t.Parallel()
+
+	const stall = 300 * time.Millisecond
+
+	versions(t, func(t *testing.T, _ int, serve func(http.Handler) (string, xhttp.Config)) {
+		t.Helper()
+
+		release := make(chan struct{})
+
+		address, config := serve(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+			if r.URL.Path == "/reads" {
+				_, _ = io.Copy(io.Discard, r.Body)
+
+				return
+			}
+
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		}))
+
+		t.Cleanup(func() { close(release) })
+
+		config.StallTimeout = stall
+		transport := xhttp.NewTransport(config)
+
+		// Far past the limit: what ends a request the limit did not.
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+
+		put := func(path string, body io.ReadCloser) (int, error) {
+			req, err := http.NewRequestWithContext(ctx, http.MethodPut, address+path, body)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			resp, err := transport.RoundTrip(req)
+			if err != nil {
+				return 0, err
+			}
+
+			_ = resp.Body.Close()
+
+			return resp.StatusCode, nil
+		}
+
+		started := time.Now()
+
+		_, err := put("/deaf", endless{})
+		if !errors.Is(err, xhttp.ErrStalled) || errors.Is(err, context.Canceled) ||
+			errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("a body the server reads none of: %v, want ErrStalled and no error of a context", err)
+		}
+
+		if err != nil && !strings.Contains(err.Error(), "stopped taking the request") {
+			t.Errorf("a body the server reads none of: %v does not say the request was not taken", err)
+		}
+
+		// A timer never fires early.
+		if waited := time.Since(started); waited < stall {
+			t.Errorf("a body the server reads none of: failed after %v, before the %v of the limit", waited, stall)
+		}
+
+		// Two reads of twice the limit each: the second while the server
+		// has had the first for longer than the limit.
+		if status, err := put("/reads", &lingering{wait: 2 * stall, pieces: 2}); err != nil || status != http.StatusOK {
+			t.Errorf("a body that takes its time, to a server that reads it: %d, %v; want 200", status, err)
+		}
+	})
+}
+
+// TestTheBodyNetHTTPTakesAgainIsReadThroughTheWaitToo: when a connection of
+// its pool turns out closed, net/http sends the request a second time
+// itself, with a body it takes from GetBody. That body's reads are still the
+// caller's time: three of twice the limit each, and the request is answered.
+func TestTheBodyNetHTTPTakesAgainIsReadThroughTheWaitToo(t *testing.T) {
+	t.Parallel()
+
+	const stall = 150 * time.Millisecond
+
+	var connections atomic.Int32
+
+	// The first connection answers one request, reads the next whole and
+	// hangs up on it; every other answers the request it is sent.
+	address := "http://" + answeringEachConnection(t, func(conn net.Conn) {
+		first := connections.Add(1) == 1
+		reader := bufio.NewReader(conn)
+
+		request, err := http.ReadRequest(reader)
+		if err != nil {
+			return
+		}
+
+		_, _ = io.Copy(io.Discard, request.Body)
+		_, _ = io.WriteString(conn, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+
+		if !first {
+			return
+		}
+
+		if unanswered, err := http.ReadRequest(reader); err == nil {
+			_, _ = io.Copy(io.Discard, unanswered.Body)
+		}
+	})
+
+	transport := xhttp.NewTransport(xhttp.Config{Cleartext: true, StallTimeout: stall})
+
+	// One request, so that the next travels on a connection of the pool.
+	warm, err := http.NewRequestWithContext(t.Context(), http.MethodGet, address, http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := transport.RoundTrip(warm)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, _ = io.Copy(io.Discard, resp.Body)
+	_ = resp.Body.Close()
+
+	req, err := http.NewRequestWithContext(
+		t.Context(),
+		http.MethodPut,
+		address,
+		io.NopCloser(strings.NewReader("content")),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// What makes net/http send a PUT again by itself.
+	req.Header.Set("Idempotency-Key", "one")
+	req.ContentLength = -1
+
+	taken := 0
+	req.GetBody = func() (io.ReadCloser, error) {
+		taken++
+
+		return &lingering{wait: 2 * stall, pieces: 3}, nil
+	}
+
+	resp, err = transport.RoundTrip(req)
+	if err != nil {
+		t.Fatalf("%v after %d connections, the body taken again %d times; want 200", err, connections.Load(), taken)
+	}
+
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK || connections.Load() != 2 || taken != 1 {
+		t.Errorf("status %d after %d connections, the body taken again %d times; want 200 after 2 and once",
+			resp.StatusCode, connections.Load(), taken)
+	}
+}
+
+// TestAnAnswerEndsTheWaitForIt: a server may answer before it has the whole
+// request, and net/http then finishes sending the request on its own. The
+// end of that sending starts no wait: the response is read to its end, past
+// the limit, as long as it keeps arriving.
+func TestAnAnswerEndsTheWaitForIt(t *testing.T) {
+	t.Parallel()
+
+	const (
+		stall  = 300 * time.Millisecond
+		pieces = 12
+	)
+
+	versions(t, func(t *testing.T, _ int, serve func(http.Handler) (string, xhttp.Config)) {
+		t.Helper()
+
+		address, config := serve(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			control := http.NewResponseController(w)
+			_ = control.EnableFullDuplex()
+
+			// Before the request's body has come, and for twice the limit.
+			for range pieces {
+				_, _ = w.Write([]byte("piece "))
+				_ = control.Flush()
+
+				select {
+				case <-time.After(stall / 6):
+				case <-r.Context().Done():
+					return
+				}
+			}
+		}))
+
+		config.StallTimeout = stall
+
+		// The body is sent a third of the limit after the answer began.
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, address, &lingering{wait: stall / 3})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		resp, err := xhttp.NewTransport(config).RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		content, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+
+		if err != nil || string(content) != strings.Repeat("piece ", pieces) {
+			t.Errorf("read %q, %v; want the %d pieces of the response", content, err, pieces)
+		}
+	})
+}
+
 // TestTheZeroConfigWatchesForAStall: the protection is on when nothing is
-// said, at the minute the docs give. It takes that long to see.
+// said, at the minute the docs give, for a body that stops and for a
+// response that never begins; and one that begins after 35 seconds is waited
+// for, which no limit shorter than the minute would allow. It takes a minute
+// to see, and the three run in that one minute.
 func TestTheZeroConfigWatchesForAStall(t *testing.T) {
 	t.Parallel()
 
-	release := make(chan struct{})
+	const late = 35 * time.Second
 
-	server, roots := secure(t, stalling(nil, release), nil)
+	release := make(chan struct{})
+	stops := stalling(nil, release)
+
+	server, roots := secure(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/stops":
+			stops(w, r)
+		case "/late":
+			select {
+			case <-time.After(late):
+				_, _ = w.Write([]byte("content"))
+			case <-r.Context().Done():
+			}
+		default:
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		}
+	}, nil)
 
 	t.Cleanup(func() { close(release) })
 
-	resp := open(t, xhttp.NewClient(xhttp.Config{Roots: roots}), server.URL+"/stops", 1)
-	started := time.Now()
+	client := xhttp.NewClient(xhttp.Config{Roots: roots})
 
-	content, err := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
+	// A timer never fires early; a clock here may start a moment after the
+	// wait it measures. It may fire late, by what a loaded machine adds, and
+	// no later.
+	aMinute := func(what string, started time.Time) {
+		t.Helper()
 
-	if !errors.Is(err, xhttp.ErrStalled) || string(content) != "first" {
-		t.Fatalf(
-			"a body that stops, under the zero Config: read %q, %v; want what arrived and ErrStalled",
-			content,
-			err,
-		)
+		if waited := time.Since(started); waited < time.Minute-time.Second || waited > time.Minute+15*time.Second {
+			t.Errorf("%s failed after %v, want a minute", what, waited)
+		}
 	}
 
-	// A timer never fires early; the first bytes may have come a moment
-	// before the clock here started. It may fire late, by what a loaded
-	// machine adds, and no later.
-	if waited := time.Since(started); waited < time.Minute-time.Second || waited > time.Minute+15*time.Second {
-		t.Errorf("the read failed after %v, want a minute", waited)
+	// Not get, which ends the test from the goroutine it is called on.
+	fetch := func(path string) (int, error) {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL+path, http.NoBody)
+		if err != nil {
+			return 0, err
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, err
+		}
+
+		_, err = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+
+		return resp.StatusCode, err
 	}
+
+	stopped := open(t, client, server.URL+"/stops", 1)
+
+	var group sync.WaitGroup
+
+	group.Go(func() {
+		started := time.Now()
+
+		content, err := io.ReadAll(stopped.Body)
+		_ = stopped.Body.Close()
+
+		if !errors.Is(err, xhttp.ErrStalled) || string(content) != "first" {
+			t.Errorf("a body that stops: read %q, %v; want what arrived and ErrStalled", content, err)
+		}
+
+		aMinute("the read of a body that stops", started)
+	})
+
+	group.Go(func() {
+		started := time.Now()
+
+		if _, err := fetch("/never"); !errors.Is(err, xhttp.ErrStalled) {
+			t.Errorf("a response that never begins: %v, want ErrStalled", err)
+		}
+
+		aMinute("a request with no response", started)
+	})
+
+	group.Go(func() {
+		if status, err := fetch("/late"); err != nil || status != http.StatusOK {
+			t.Errorf("a response that begins after %v: %d, %v; want 200", late, status, err)
+		}
+	})
+
+	group.Wait()
 }
 
 // TestANegativeStallTimeoutWaitsForEver: a body that pauses is a stall under
@@ -797,30 +1408,180 @@ func TestCredentialGoesToItsHostsOnly(t *testing.T) {
 	expect("a request with its own header", &own, "Basic the-caller's")
 }
 
-func TestRedirectsWithinHTTPSOnly(t *testing.T) {
+// TestNoRedirectLeavesHTTPS: every chain of up to three redirects between an
+// https server and a cleartext one, under a transport that sends cleartext,
+// through a client of the caller's own with no redirect policy, one that
+// allows everything, and NewClient's. A chain is followed up to the first
+// redirect that leads from https to cleartext, which is ErrRedirect, and the
+// request it leads to is never sent.
+func TestNoRedirectLeavesHTTPS(t *testing.T) {
 	t.Parallel()
 
-	plain := httptest.NewServer(http.HandlerFunc(ok))
-	t.Cleanup(plain.Close)
+	var (
+		mu   sync.Mutex
+		seen = map[string][]string{}
+	)
 
-	server, roots := secure(t, func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/down":
-			http.Redirect(w, r, plain.URL, http.StatusFound)
-		case "/once":
-			http.Redirect(w, r, "/", http.StatusFound)
+	addresses := map[string]string{}
+
+	// Each request names its chain and the schemes still to go through.
+	handler := func(scheme string) http.HandlerFunc {
+		return func(w http.ResponseWriter, r *http.Request) {
+			chain, left := r.URL.Query().Get("chain"), r.URL.Query().Get("left")
+
+			mu.Lock()
+
+			seen[chain] = append(seen[chain], scheme)
+			mu.Unlock()
+
+			if left == "" {
+				return
+			}
+
+			next, rest, _ := strings.Cut(left, ",")
+
+			http.Redirect(w, r, addresses[next]+"/?chain="+url.QueryEscape(chain)+"&left="+rest, http.StatusFound)
 		}
-	}, nil)
-
-	// Cleartext, so that the redirect is what refuses, not the transport.
-	client := xhttp.NewClient(xhttp.Config{Roots: roots, Cleartext: true})
-
-	if status, err := get(t.Context(), t, client, server.URL+"/once"); err != nil || status != http.StatusOK {
-		t.Errorf("one redirect within https = %d, %v; want 200", status, err)
 	}
 
-	if _, err := get(t.Context(), t, client, server.URL+"/down"); !errors.Is(err, xhttp.ErrRedirect) {
-		t.Errorf("a redirect from https to http = %v, want ErrRedirect", err)
+	secured, roots := secure(t, handler("https"), nil)
+
+	plain := httptest.NewServer(handler("http"))
+	t.Cleanup(plain.Close)
+
+	addresses["https"], addresses["http"] = secured.URL, plain.URL
+
+	config := xhttp.Config{Roots: roots, Cleartext: true}
+
+	clients := map[string]*http.Client{
+		"a client with no policy": {Transport: xhttp.NewTransport(config)},
+		"a client that follows everything": {
+			Transport:     xhttp.NewTransport(config),
+			CheckRedirect: func(*http.Request, []*http.Request) error { return nil },
+		},
+		"NewClient": xhttp.NewClient(config),
+	}
+
+	var chains [][]string
+
+	for _, first := range []string{"https", "http"} {
+		chains = append(chains, []string{first})
+	}
+
+	for at := 0; at < len(chains); at++ {
+		if len(chains[at]) > 3 {
+			continue
+		}
+
+		for _, next := range []string{"https", "http"} {
+			chains = append(chains, append(slices.Clone(chains[at]), next))
+		}
+	}
+
+	for name, client := range clients {
+		for _, chain := range chains {
+			// What is sent: the chain up to its first step from https to
+			// cleartext.
+			sent, refused := chain, false
+
+			for at := 1; at < len(chain); at++ {
+				if chain[at-1] == "https" && chain[at] == "http" {
+					sent, refused = chain[:at], true
+
+					break
+				}
+			}
+
+			id := name + ": " + strings.Join(chain, " to ")
+
+			address := addresses[chain[0]] + "/?chain=" + url.QueryEscape(id) + "&left=" + strings.Join(chain[1:], ",")
+
+			status, err := get(t.Context(), t, client, address)
+
+			switch {
+			case refused && !errors.Is(err, xhttp.ErrRedirect):
+				t.Errorf("%s: %d, %v; want ErrRedirect", id, status, err)
+			case !refused && (err != nil || status != http.StatusOK):
+				t.Errorf("%s: %d, %v; want 200", id, status, err)
+			}
+
+			mu.Lock()
+
+			if !slices.Equal(seen[id], sent) {
+				t.Errorf("%s: the servers saw %v, want %v", id, seen[id], sent)
+			}
+
+			mu.Unlock()
+		}
+	}
+
+	// Under a transport that sends no cleartext at all, it is still the
+	// redirect that is refused.
+	strict := &http.Client{Transport: xhttp.NewTransport(xhttp.Config{Roots: roots})}
+
+	if _, err := get(
+		t.Context(),
+		t,
+		strict,
+		secured.URL+"/?chain=strict&left=http",
+	); !errors.Is(
+		err,
+		xhttp.ErrRedirect,
+	) {
+		t.Errorf("with no cleartext allowed, https to http: %v, want ErrRedirect", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	if !slices.Equal(seen["strict"], []string{"https"}) {
+		t.Errorf(
+			"with no cleartext allowed, https to http: the servers saw %v, want the first request alone",
+			seen["strict"],
+		)
+	}
+}
+
+// TestARedirectFromNowhereDoesNotLeaveHTTPS: a request made on a redirect
+// whose response names no request, or a request with no URL, is taken to
+// come from https, and is not carried to another scheme.
+func TestARedirectFromNowhereDoesNotLeaveHTTPS(t *testing.T) {
+	t.Parallel()
+
+	var reached atomic.Int32
+
+	plain := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached.Add(1) }))
+	t.Cleanup(plain.Close)
+
+	transport := xhttp.NewTransport(xhttp.Config{Cleartext: true})
+
+	for what, via := range map[string]*http.Response{
+		"no request":            {StatusCode: http.StatusFound, Body: http.NoBody},
+		"a request with no URL": {StatusCode: http.StatusFound, Body: http.NoBody, Request: &http.Request{}},
+	} {
+		body := &closing{Reader: strings.NewReader("content")}
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, plain.URL, body)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		req.Response = via
+
+		resp, err := transport.RoundTrip(req)
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
+
+		if !errors.Is(err, xhttp.ErrRedirect) || reached.Load() != 0 || !body.closed.Load() {
+			t.Errorf(
+				"a redirect with %s: %v, the server reached %d times, the body closed: %t; want ErrRedirect, none, and closed",
+				what,
+				err,
+				reached.Load(),
+				body.closed.Load(),
+			)
+		}
 	}
 }
 
