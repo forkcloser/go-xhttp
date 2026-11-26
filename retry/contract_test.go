@@ -14,7 +14,8 @@ package retry_test
 //     whole body again;
 //   - nothing is sent again once the request's context is done, for a
 //     certificate that is not trusted, for a host that does not resolve, or
-//     for what xhttp refuses: ErrOffline, ErrCleartext, ErrHandshakeRefused;
+//     for what xhttp refuses: ErrOffline, ErrCleartext, ErrHandshakeRefused,
+//     ErrPinMismatch;
 //     nor a request with no URL or no header map (RoundTripper: "The
 //     Request's URL and Header fields must be initialized");
 //   - a request that is not sent again keeps the answer it has, as its
@@ -50,6 +51,7 @@ package retry_test
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -519,6 +521,14 @@ func TestWhatNoAttemptChangesIsNotRetried(t *testing.T) {
 
 	trusting := xhttp.Config{Roots: oldTLS.Client().Transport.(*http.Transport).TLSClientConfig.RootCAs}
 
+	// A pin of the untrusted server to a certificate it does not have.
+	pin, err := xhttp.NewPin(strings.TrimPrefix(untrusted.URL, "https://"), strings.Repeat("ab", sha256.Size))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	pinned := xhttp.NewTransport(xhttp.Config{Pin: pin})
+
 	for name, permanent := range map[string]struct {
 		base    http.RoundTripper
 		address string
@@ -548,6 +558,16 @@ func TestWhatNoAttemptChangesIsNotRetried(t *testing.T) {
 			xhttp.NewTransport(xhttp.Config{}),
 			"http://server.test/",
 			func(err error) bool { return errors.Is(err, xhttp.ErrCleartext) },
+		},
+		"a certificate that is not the pinned one": {
+			pinned,
+			untrusted.URL,
+			func(err error) bool { return errors.Is(err, xhttp.ErrPinMismatch) },
+		},
+		"a host that is not the pinned one": {
+			pinned,
+			"https://server.test/",
+			func(err error) bool { return errors.Is(err, xhttp.ErrPinMismatch) },
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

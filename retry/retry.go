@@ -337,7 +337,9 @@ func unsent(err error) bool {
 
 // permanent reports an error no further attempt changes.
 func permanent(err error) bool {
-	for _, refusal := range []error{xhttp.ErrOffline, xhttp.ErrCleartext, xhttp.ErrHandshakeRefused} {
+	for _, refusal := range []error{
+		xhttp.ErrOffline, xhttp.ErrCleartext, xhttp.ErrHandshakeRefused, xhttp.ErrPinMismatch,
+	} {
 		if errors.Is(err, refusal) {
 			return true
 		}
