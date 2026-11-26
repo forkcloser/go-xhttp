@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/forkcloser/xhttp"
@@ -330,23 +331,22 @@ func permanent(err error) bool {
 
 // retryAfter is the wait a Retry-After header asks for (RFC 9110 section
 // 10.2.3: a number of seconds, or a date), and whether it is obeyed: one
-// longer than limit is not. No header, one that is neither form, a negative
-// number and a date in the past ask for no wait.
+// longer than limit is not. No header, one that is neither form and a date
+// in the past ask for no wait.
 func retryAfter(value string, limit time.Duration) (time.Duration, bool) {
 	if value == "" {
 		return 0, true
 	}
 
-	// Compared in seconds: a number of them read from a header overflows a
-	// duration, and one too large for 64 bits is read as the largest.
-	switch seconds, err := strconv.ParseInt(value, 10, 64); {
-	case err != nil && !errors.Is(err, strconv.ErrRange):
-		// No number: a date, perhaps.
-	case seconds < 0:
-		return 0, true
-	case seconds > int64(limit/time.Second):
-		return 0, false
-	default:
+	// Digits and nothing else: ParseInt alone also reads a sign.
+	if !strings.ContainsFunc(value, func(char rune) bool { return char < '0' || char > '9' }) {
+		// Compared in seconds: a number of them read from a header
+		// overflows a duration. One too large for 64 bits is an error.
+		seconds, err := strconv.ParseInt(value, 10, 64)
+		if err != nil || seconds > int64(limit/time.Second) {
+			return 0, false
+		}
+
 		return time.Duration(seconds) * time.Second, true
 	}
 

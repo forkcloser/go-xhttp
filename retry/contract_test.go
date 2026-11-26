@@ -31,7 +31,9 @@ package retry_test
 //     MaxBackoff when that is less: no wait is longer, and they do not
 //     gather on it. A Retry-After that asks for longer is obeyed (RFC 9110,
 //     10.2.3: "how long the user agent ought to wait"), drawn evenly from
-//     what it asks to a quarter more, or to MaxBackoff;
+//     what it asks to a quarter more, or to MaxBackoff. It asks as a delay,
+//     which is digits and nothing else (delay-seconds = 1*DIGIT), or as a
+//     date; a value that is neither asks for nothing;
 //   - the caller's request is left as it was, and is the response's Request;
 //     a trailer the caller sets while the body is read is sent with each
 //     attempt;
