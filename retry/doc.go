@@ -59,5 +59,9 @@
 // that would outlast the context's deadline is not begun.
 //
 // A retry is a log/slog record at the debug level, with the method, the host
-// and the cause, and never the path or the query.
+// and the cause: the status, or the attempt's error. The package writes
+// neither the path nor the query, and of an error net/http's client worded,
+// a *url.Error that holds the whole URL, the record has the error inside.
+// An error that another transport words with the URL in it is logged as that
+// transport worded it.
 package retry

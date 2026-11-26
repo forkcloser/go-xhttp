@@ -37,7 +37,10 @@ package retry_test
 //   - the caller's request is left as it was, and is the response's Request;
 //     a trailer the caller sets while the body is read is sent with each
 //     attempt;
-//   - a retry is a debug record with the method and the host, and no path;
+//   - a retry is a debug record with the method, the host and the cause,
+//     the status or the error, and no path and no query, those of a
+//     *url.Error included (net/url: "Error reports an error and the
+//     operation and URL that caused it");
 //   - the zero Options sends each request once; a nil base panics, and so
 //     does a negative Retries, Backoff or MaxBackoff.
 
@@ -1026,9 +1029,10 @@ func (r *records) WithAttrs([]slog.Attr) slog.Handler { return r }
 func (r *records) WithGroup(string) slog.Handler      { return r }
 
 // TestARetryIsLoggedWithoutThePath: one debug record for each retry, with
-// the method and the host, and nothing of the path or the query, where a
-// signed URL keeps its secret. The default logger is the process's, which is
-// why this does not run in parallel.
+// the method, the host and the cause, and nothing of the path or the query,
+// where a signed URL keeps its secret: not from the request, and not from an
+// error net/http's client worded with the URL. The default logger is the
+// process's, which is why this does not run in parallel.
 func TestARetryIsLoggedWithoutThePath(t *testing.T) { //nolint:paralleltest // slog's default logger is process-wide
 	previous := slog.Default()
 
@@ -1037,17 +1041,34 @@ func TestARetryIsLoggedWithoutThePath(t *testing.T) { //nolint:paralleltest // s
 	kept := &records{}
 	slog.SetDefault(slog.New(kept))
 
-	base := &scripted{script: []answer{{status: http.StatusServiceUnavailable}, {err: errFlaky}}}
+	// As net/http's client words an error, alone and inside another.
+	worded := &url.Error{Op: "Get", URL: "https://server.test/path?query=secret", Err: errFlaky}
 
-	if status, err := send(t, base, quick(3), http.MethodGet, nil); err != nil || status != http.StatusOK {
+	// A client's error that holds another client's, for another URL.
+	issuer := &url.Error{Op: "Post", URL: "https://issuer.test/token?assertion=secret", Err: errFlaky}
+
+	base := &scripted{script: []answer{
+		{status: http.StatusServiceUnavailable},
+		{err: errFlaky},
+		{err: worded},
+		{err: fmt.Errorf("fetching a token: %w", worded)},
+		{err: &url.Error{Op: "Get", URL: worded.URL, Err: issuer}},
+		{err: &url.Error{Op: "Get", URL: worded.URL, Err: fmt.Errorf("fetching a token: %w", issuer)}},
+	}}
+
+	causes := []string{
+		"status=503", errFlaky.Error(), errFlaky.Error(), errFlaky.Error(), errFlaky.Error(), errFlaky.Error(),
+	}
+
+	if status, err := send(t, base, quick(len(causes)), http.MethodGet, nil); err != nil || status != http.StatusOK {
 		t.Fatalf("%d, %v; want 200", status, err)
 	}
 
-	if len(kept.kept) != 2 {
-		t.Fatalf("%d records for 2 retries", len(kept.kept))
+	if len(kept.kept) != len(causes) {
+		t.Fatalf("%d records for %d retries", len(kept.kept), len(causes))
 	}
 
-	for _, record := range kept.kept {
+	for index, record := range kept.kept {
 		var line strings.Builder
 
 		line.WriteString(record.Message)
@@ -1061,13 +1082,13 @@ func TestARetryIsLoggedWithoutThePath(t *testing.T) { //nolint:paralleltest // s
 			t.Errorf("%q is at level %v, want debug", line.String(), record.Level)
 		}
 
-		for _, want := range []string{"method=GET", "host=server.test"} {
+		for _, want := range []string{"method=GET", "host=server.test", "retry=" + strconv.Itoa(index+1), causes[index]} {
 			if !strings.Contains(line.String(), want) {
 				t.Errorf("%q does not say %s", line.String(), want)
 			}
 		}
 
-		for _, secret := range []string{"path", "query", "secret"} {
+		for _, secret := range []string{"path", "query", "secret", "issuer", "assertion"} {
 			if strings.Contains(line.String(), secret) {
 				t.Errorf("%q holds %q, of the URL's path or query", line.String(), secret)
 			}

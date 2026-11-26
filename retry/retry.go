@@ -9,6 +9,7 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -229,9 +230,22 @@ func (t *transport) between(low, high float64) time.Duration {
 }
 
 func (*transport) log(req *http.Request, status int, err error, retry int, wait time.Duration) {
-	cause := slog.Any("error", err)
-	if err == nil {
-		cause = slog.Int("status", status)
+	cause := slog.Int("status", status)
+
+	if err != nil {
+		// net/http's client words its errors with the whole URL: what is
+		// inside is the cause, and the record has the host already. Every
+		// one of the chain: a client's error may hold another client's.
+		for {
+			worded, found := errors.AsType[*url.Error](err)
+			if !found {
+				break
+			}
+
+			err = worded.Err
+		}
+
+		cause = slog.Any("error", err)
 	}
 
 	slog.LogAttrs(req.Context(), slog.LevelDebug, "retrying an HTTP request",
