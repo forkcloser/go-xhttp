@@ -18,4 +18,7 @@ var (
 	ErrStalled = errors.New("the response body stopped arriving")
 	// ErrRedirect is the error of a redirect the client does not follow.
 	ErrRedirect = errors.New("redirect refused")
+	// ErrCredential is the error of [NewCredential] for what would not
+	// arrive as it is, or could never match a request.
+	ErrCredential = errors.New("not a credential")
 )

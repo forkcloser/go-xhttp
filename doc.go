@@ -24,12 +24,12 @@
 //
 // A client from [NewClient] also follows at most ten redirects,
 // and none from https to anything else ([Redirects]). [Authorize] adds a
-// token to the requests for the hosts the token names, over https, and to no
-// other request.
+// token to the requests for the hosts its [Credential] names, over https, and
+// to no other request, nor to one a redirect from another host led to.
 //
 // # Errors
 //
-// A fault the posture itself raises wraps one of five sentinels, each named
+// A fault the package itself raises wraps one of six sentinels, each named
 // for what a caller does on it:
 //
 //   - [ErrOffline]: the transport was told to be offline. Nothing was dialed.
@@ -41,6 +41,8 @@
 //   - [ErrStalled]: the body stopped arriving. What was read is the caller's,
 //     and so is asking for the rest.
 //   - [ErrRedirect]: a redirect was not followed.
+//   - [ErrCredential]: [NewCredential] was given what would not arrive as
+//     it is, or could never match. Fix the argument the error names.
 //
 // Every other error is the standard library's and passes through unchanged.
 //

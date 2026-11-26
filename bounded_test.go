@@ -6,13 +6,21 @@ package xhttp_test
 // one past it.
 
 import (
+	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"slices"
 	"strconv"
+	"strings"
 	"testing"
+	"unicode"
 
 	"github.com/forkcloser/xhttp"
 )
@@ -70,16 +78,28 @@ func (f answering) RoundTrip(req *http.Request) (*http.Response, error) {
 	return &http.Response{StatusCode: http.StatusOK, Body: http.NoBody, Request: req}, nil
 }
 
+// credential is NewCredential for arguments the test knows to be good.
+func credential(t *testing.T, scheme, token string, hosts ...string) xhttp.Credential {
+	t.Helper()
+
+	made, err := xhttp.NewCredential(scheme, token, hosts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	return made
+}
+
 // carried reports whether a request for target, through a transport that
-// has a credential for hosts, goes out with the credential's token.
-func carried(t *testing.T, hosts []string, target *url.URL) bool {
+// has the credential, a Bearer one, goes out with its token.
+func carried(t *testing.T, held xhttp.Credential, target *url.URL) bool {
 	t.Helper()
 
 	var sent string
 
 	transport := xhttp.Authorize(
 		answering(func(req *http.Request) { sent = req.Header.Get("Authorization") }),
-		xhttp.Credential{Token: "token", Hosts: hosts},
+		held,
 	)
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://replaced.test/", http.NoBody)
@@ -110,20 +130,110 @@ func carried(t *testing.T, hosts []string, target *url.URL) bool {
 	}
 }
 
+var errNotDialed = errors.New("the address is all the test wants")
+
+type dialedKey struct{}
+
+// standard is net/http's own transport, which dials nothing and tells the
+// address it would have dialed.
+//
+//nolint:gochecknoglobals // one transport for every call: the fuzz target makes two a run
+var standard = &http.Transport{
+	Proxy: nil,
+	DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
+		if into, ok := ctx.Value(dialedKey{}).(*string); ok {
+			*into = address
+		}
+
+		return nil, errNotDialed
+	},
+}
+
+// dialed is the address net/http dials for a request to target, as net
+// reads it: an address and a port, or a name in lower case and a port. It
+// is empty when net/http dials nothing for it.
+func dialed(t *testing.T, target *url.URL) string {
+	t.Helper()
+
+	var address string
+
+	req, err := http.NewRequestWithContext(
+		context.WithValue(t.Context(), dialedKey{}, &address),
+		http.MethodGet,
+		"https://replaced.test/",
+		http.NoBody,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req.URL = target
+
+	resp, err := standard.RoundTrip(req)
+	if err == nil {
+		_ = resp.Body.Close()
+
+		t.Fatalf("%s: net/http answered a request it could not have sent", target)
+	}
+
+	name, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return ""
+	}
+
+	number, err := strconv.ParseUint(port, 10, 16)
+	if err != nil {
+		return ""
+	}
+
+	if addr, err := netip.ParseAddr(name); err == nil {
+		return netip.AddrPortFrom(addr, uint16(number)).String()
+	}
+
+	return net.JoinHostPort(strings.ToLower(name), strconv.FormatUint(number, 10))
+}
+
+// ascii reports whether text is ASCII.
+func ascii(text string) bool {
+	return !strings.ContainsFunc(text, func(char rune) bool { return char > unicode.MaxASCII })
+}
+
+// due is the contract's own answer: a credential for the host named goes
+// with a request for target when target is https, writes its host in ASCII,
+// and is dialed by net/http at the address it dials for the host named.
+func due(t *testing.T, named string, target *url.URL) bool {
+	t.Helper()
+
+	address := dialed(t, target)
+
+	return target.Scheme == "https" && ascii(target.Host) && address != "" &&
+		address == dialed(t, &url.URL{Scheme: "https", Host: named})
+}
+
 // TestCredentialHostMatching: a credential is for the whole host name and
-// the one port it names, and for nothing that looks like them.
+// the one port it names, and for nothing that looks like them. Each answer
+// is held twice: to the table, and to the address net/http dials.
 func TestCredentialHostMatching(t *testing.T) {
 	t.Parallel()
 
-	hosts := []string{"registry.test", "ported.test:8443", "[::1]:8443", "[::2]", "192.0.2.1", "default.test:443"}
+	hosts := []string{
+		"registry.test", "ported.test:8443", "[::1]:8443", "[::2]", "192.0.2.1", "default.test:443",
+		"UPPER.test", "under_score.test", "xn--4xa.test", "[fe80::1]", "zeros.test:0443",
+		"kernel.test",
+	}
+
+	held := credential(t, "Bearer", "token", hosts...)
 
 	for address, want := range map[string]bool{
 		"https://registry.test/":           true,
 		"https://REGISTRY.TEST/":           true,
 		"https://registry.test:443/":       true,
+		"https://registry.test:0443/":      true,
+		"https://registry.test:/":          true,
 		"https://user@registry.test/":      true,
 		"https://registry.test:8443/":      false,
 		"https://registry.test:4430/":      false,
+		"https://registry.test:65979/":     false,
 		"https://notregistry.test/":        false,
 		"https://sub.registry.test/":       false,
 		"https://registry.test.evil.test/": false,
@@ -135,59 +245,231 @@ func TestCredentialHostMatching(t *testing.T) {
 		"https://ported.test/":             false,
 		"https://ported.test:443/":         false,
 		"https://[::1]:8443/":              true,
+		"https://[0:0:0:0:0:0:0:1]:8443/":  true,
 		"https://[::1]/":                   false,
 		"https://[::2]/":                   true,
 		"https://[::2]:443/":               true,
 		"https://[::2]:8443/":              false,
+		"https://[::ffff:192.0.2.1]/":      false,
 		"https://192.0.2.1/":               true,
 		"https://192.0.2.10/":              false,
+		"https://192.0.02.1/":              false,
 		"https://192.0.2.1:8443/":          false,
 		"https://default.test/":            true,
 		"https://default.test:443/":        true,
+		"https://upper.test/":              true,
+		"https://under_score.test/":        true,
+		"https://xn--4xa.test/":            true,
+		"https://XN--4XA.test/":            true,
+		"https://[fe80::1]/":               true,
+		"https://[fe80::1%25en0]/":         false,
+		"https://zeros.test/":              true,
 		"https://unnamed.test/":            false,
+		"https://kernel.test/":             true,
+		// A host outside ASCII gets no credential, the one net/http dials
+		// as a named host included: sigma for xn--4xa, the Kelvin sign
+		// (U+212A) for k and the long s (U+017F) for s.
+		"https://σ.test/":             false,
+		"https://ς.test/":             false,
+		"https://regi\u017ftry.test/": false,
+		"https://\u212aernel.test/":   false,
 	} {
 		target, err := url.Parse(address)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		if got := carried(t, hosts, target); got != want {
+		if got := carried(t, held, target); got != want {
 			t.Errorf("%s: the token was sent: %t, want %t", address, got, want)
+		}
+
+		owed := slices.ContainsFunc(hosts, func(named string) bool { return due(t, named, target) })
+		if owed != want {
+			t.Errorf("%s: net/http's dialing makes it %t, the table says %t", address, owed, want)
 		}
 	}
 
-	if carried(t, nil, &url.URL{Scheme: "https", Host: "registry.test"}) {
-		t.Error("a credential that names no host was sent")
+	if carried(t, xhttp.Credential{}, &url.URL{Scheme: "https", Host: "registry.test"}) {
+		t.Error("the zero Credential was sent")
+	}
+}
+
+// TestNewCredentialRefuses: what could not be sent, or could never match,
+// is ErrCredential when the credential is made, and the error does not hold
+// the token.
+func TestNewCredentialRefuses(t *testing.T) {
+	t.Parallel()
+
+	const secret = "s3cr3t-token"
+
+	for what, args := range map[string]struct {
+		scheme, token string
+		hosts         []string
+	}{
+		"no scheme":                    {"", secret, []string{"registry.test"}},
+		"a scheme of two words":        {"Bearer token", secret, []string{"registry.test"}},
+		"a scheme with a colon":        {"Bearer:", secret, []string{"registry.test"}},
+		"a scheme outside ASCII":       {"Beärer", secret, []string{"registry.test"}},
+		"no token":                     {"Bearer", "", []string{"registry.test"}},
+		"a token that ends a line":     {"Bearer", secret + "\n", []string{"registry.test"}},
+		"a token with a line inside":   {"Bearer", secret + "\r\nHost: evil.test", []string{"registry.test"}},
+		"a token with a NUL":           {"Bearer", secret + "\x00", []string{"registry.test"}},
+		"a token with a DEL":           {"Bearer", secret + "\x7f", []string{"registry.test"}},
+		"a token that starts in space": {"Bearer", " " + secret, []string{"registry.test"}},
+		"a token that ends in space":   {"Bearer", secret + " ", []string{"registry.test"}},
+		"a token that starts in a tab": {"Bearer", "\t" + secret, []string{"registry.test"}},
+		"a token that ends in a tab":   {"Bearer", secret + "\t", []string{"registry.test"}},
+		"a token that is one space":    {"Bearer", " ", []string{"registry.test"}},
+		"no host":                      {"Bearer", secret, nil},
+		"an empty host":                {"Bearer", secret, []string{""}},
+		"one bad host of two":          {"Bearer", secret, []string{"registry.test", "https://registry.test"}},
+		"a URL":                        {"Bearer", secret, []string{"https://registry.test"}},
+		"a host and a slash":           {"Bearer", secret, []string{"registry.test/"}},
+		"a host and a path":            {"Bearer", secret, []string{"registry.test/v2"}},
+		"a wildcard":                   {"Bearer", secret, []string{"*.registry.test"}},
+		"a space before":               {"Bearer", secret, []string{" registry.test"}},
+		"a space after":                {"Bearer", secret, []string{"registry.test "}},
+		"a user":                       {"Bearer", secret, []string{"user@registry.test"}},
+		"a port that is a name":        {"Bearer", secret, []string{"registry.test:https"}},
+		"a colon and no port":          {"Bearer", secret, []string{"registry.test:"}},
+		"port zero":                    {"Bearer", secret, []string{"registry.test:0"}},
+		"a port past the last":         {"Bearer", secret, []string{"registry.test:65536"}},
+		"a signed port":                {"Bearer", secret, []string{"registry.test:+443"}},
+		"a port and no host":           {"Bearer", secret, []string{":443"}},
+		"a dot at the end":             {"Bearer", secret, []string{"registry.test."}},
+		"a dot at the start":           {"Bearer", secret, []string{".registry.test"}},
+		"two dots":                     {"Bearer", secret, []string{"registry..test"}},
+		"a label of 64":                {"Bearer", secret, []string{strings.Repeat("a", 64) + ".test"}},
+		"a name of 254":                {"Bearer", secret, []string{strings.Repeat("a.", 126) + "ab"}},
+		"a name outside ASCII":         {"Bearer", secret, []string{"σ.test"}},
+		"a name that is not UTF-8":     {"Bearer", secret, []string{"registry\xff.test"}},
+		"IPv6 with no brackets":        {"Bearer", secret, []string{"::1"}},
+		"IPv6 and a port, no brackets": {"Bearer", secret, []string{"::1:8443"}},
+		"IPv4 in brackets":             {"Bearer", secret, []string{"[192.0.2.1]"}},
+		"a name in brackets":           {"Bearer", secret, []string{"[registry.test]"}},
+		"brackets twice":               {"Bearer", secret, []string{"[[::2]]"}},
+		"an opening bracket alone":     {"Bearer", secret, []string{"[::2"}},
+		"a closing bracket alone":      {"Bearer", secret, []string{"::2]"}},
+		"a bracket before a name":      {"Bearer", secret, []string{"]registry.test"}},
+		"a bracket after a name":       {"Bearer", secret, []string{"registry.test]"}},
+		"brackets and no colon":        {"Bearer", secret, []string{"[::2]8443"}},
+		"brackets and no port":         {"Bearer", secret, []string{"[::2]:"}},
+		"nothing in brackets":          {"Bearer", secret, []string{"[]"}},
+		"a zone":                       {"Bearer", secret, []string{"[fe80::1%en0]"}},
+		"a zone as a URL writes it":    {"Bearer", secret, []string{"[fe80::1%25en0]"}},
+		"a zone with a bracket":        {"Bearer", secret, []string{"[::%]]"}},
+		"an empty zone":                {"Bearer", secret, []string{"[fe80::1%]"}},
+	} {
+		made, err := xhttp.NewCredential(args.scheme, args.token, args.hosts...)
+
+		switch {
+		case !errors.Is(err, xhttp.ErrCredential):
+			t.Errorf("%s: %v, want ErrCredential", what, err)
+		case strings.Contains(err.Error(), secret):
+			t.Errorf("%s: the error holds the token: %v", what, err)
+		case carried(t, made, &url.URL{Scheme: "https", Host: "registry.test"}):
+			t.Errorf("%s: what came back with the error was sent", what)
+		}
 	}
 
-	// A bracket that is not one of a pair is part of a name no host has.
-	for _, stray := range []string{
-		"]registry.test", "[registry.test", "registry.test]", "[[::2]]",
-		// With one more character at the other end, which a cut of both ends would drop.
-		"xregistry.test]", "[registry.testx", "x::2]", "[::2x",
+	// At each limit, the last one that is taken.
+	for what, host := range map[string]string{
+		"a label of 63":   strings.Repeat("a", 63) + ".test",
+		"a name of 253":   strings.Repeat("a.", 126) + "a",
+		"the last port":   "registry.test:65535",
+		"the first port":  "registry.test:1",
+		"one label":       "localhost",
+		"a hyphen":        "my-registry.test",
+		"digits":          "0",
+		"IPv6 and a port": "[2001:db8::1]:8443",
+		"IPv4 and a port": "192.0.2.1:8443",
 	} {
-		for _, address := range []string{"https://registry.test/", "https://[::2]/"} {
-			target, err := url.Parse(address)
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			if carried(t, []string{stray}, target) {
-				t.Errorf("a credential for %q was sent to %s", stray, address)
-			}
+		if _, err := xhttp.NewCredential("Bearer", secret, host); err != nil {
+			t.Errorf("%s: %v", what, err)
 		}
 	}
 }
 
-func TestCredentialScheme(t *testing.T) {
+// TestATokenIsWhatAFieldCarries: for every octet, between two letters of a
+// token, NewCredential takes the token exactly when net/http's own transport
+// takes a request with it as its Authorization, and the token then goes out
+// as it was given.
+func TestATokenIsWhatAFieldCarries(t *testing.T) {
 	t.Parallel()
 
-	for scheme, want := range map[string]string{"": "Bearer secret", "Basic": "Basic secret", "token": "token secret"} {
+	for octet := range 256 {
+		token := "a" + string([]byte{byte(octet)}) + "b"
+
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://registry.test/", http.NoBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		req.Header.Set("Authorization", "Bearer "+token)
+
+		// net/http refuses a header it will not write before it dials.
+		resp, err := standard.RoundTrip(req)
+		if err == nil {
+			_ = resp.Body.Close()
+
+			t.Fatal("net/http answered a request it could not have sent")
+		}
+
+		taken := errors.Is(err, errNotDialed)
+
+		held, err := xhttp.NewCredential("Bearer", token, "registry.test")
+		if (err == nil) != taken {
+			t.Errorf("octet %#02x: NewCredential: %v; net/http takes it: %t", octet, err, taken)
+
+			continue
+		}
+
+		if err != nil {
+			continue
+		}
+
 		var sent string
 
 		transport := xhttp.Authorize(
 			answering(func(req *http.Request) { sent = req.Header.Get("Authorization") }),
-			xhttp.Credential{Scheme: scheme, Token: "secret", Hosts: []string{"registry.test"}},
+			held,
+		)
+
+		req, err = http.NewRequestWithContext(t.Context(), http.MethodGet, "https://registry.test/", http.NoBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		resp, err = transport.RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_ = resp.Body.Close()
+
+		if sent != "Bearer "+token {
+			t.Errorf("octet %#02x: Authorization %q, want the token as it was given", octet, sent)
+		}
+	}
+}
+
+// TestCredentialSchemeAndToken: the Authorization is the scheme, a space and
+// the token, as they were given.
+func TestCredentialSchemeAndToken(t *testing.T) {
+	t.Parallel()
+
+	for _, given := range [][2]string{
+		{"Bearer", "secret"},
+		{"Basic", "dXNlcjpzZWNyZXQ="},
+		{"token", "secret"},
+		{"Digest", `username="user", realm="registry", response="6629fae4"`},
+		{"!#$%&'*+-.^_`|~09azAZ", "~"},
+	} {
+		var sent string
+
+		transport := xhttp.Authorize(
+			answering(func(req *http.Request) { sent = req.Header.Get("Authorization") }),
+			credential(t, given[0], given[1], "registry.test"),
 		)
 
 		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://registry.test/", http.NoBody)
@@ -202,26 +484,32 @@ func TestCredentialScheme(t *testing.T) {
 
 		_ = resp.Body.Close()
 
-		if sent != want {
-			t.Errorf("scheme %q: Authorization %q, want %q", scheme, sent, want)
+		if want := given[0] + " " + given[1]; sent != want {
+			t.Errorf("Authorization %q, want %q", sent, want)
 		}
 	}
 }
 
 // TestTheFirstCredentialForAHostIsSent: of two credentials that name a host,
-// the first with a token.
+// the first, whatever the caller does afterwards with the slice it gave.
 func TestTheFirstCredentialForAHostIsSent(t *testing.T) {
 	t.Parallel()
 
 	var sent string
 
+	given := []xhttp.Credential{
+		credential(t, "Bearer", "elsewhere", "other.test"),
+		{},
+		credential(t, "Bearer", "first", "registry.test"),
+		credential(t, "Bearer", "second", "registry.test"),
+	}
+
 	transport := xhttp.Authorize(
 		answering(func(req *http.Request) { sent = req.Header.Get("Authorization") }),
-		xhttp.Credential{Token: "elsewhere", Hosts: []string{"other.test"}},
-		xhttp.Credential{Hosts: []string{"registry.test"}},
-		xhttp.Credential{Token: "first", Hosts: []string{"registry.test"}},
-		xhttp.Credential{Token: "second", Hosts: []string{"registry.test"}},
+		given...,
 	)
+
+	given[2] = given[3]
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, "https://registry.test/", http.NoBody)
 	if err != nil {
@@ -236,7 +524,227 @@ func TestTheFirstCredentialForAHostIsSent(t *testing.T) {
 	_ = resp.Body.Close()
 
 	if sent != "Bearer first" {
-		t.Errorf("Authorization %q, want the first credential that names the host and has a token", sent)
+		t.Errorf("Authorization %q, want the first credential that names the host", sent)
+	}
+}
+
+// followed is a request for the last of the addresses, made as http.Client
+// makes one on a redirect: its Response is the answer to a request for the
+// address before it, and so on back to first.
+func followed(t *testing.T, first string, redirects ...string) *http.Request {
+	t.Helper()
+
+	made, err := http.NewRequestWithContext(t.Context(), http.MethodGet, first, http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, address := range redirects {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, address, http.NoBody)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		req.Response = &http.Response{StatusCode: http.StatusFound, Body: http.NoBody, Request: made}
+		made = req
+	}
+
+	return made
+}
+
+// authorization is the Authorization a request goes out with through a
+// transport that has the credentials.
+func authorization(t *testing.T, req *http.Request, held ...xhttp.Credential) string {
+	t.Helper()
+
+	var sent string
+
+	transport := xhttp.Authorize(
+		answering(func(req *http.Request) { sent = req.Header.Get("Authorization") }),
+		held...,
+	)
+
+	resp, err := transport.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = resp.Body.Close()
+
+	return sent
+}
+
+// TestCredentialAfterRedirects: every chain of up to three redirects that
+// ends at a host the credential names, through hosts it names and hosts it
+// does not. The token goes exactly when every request of the chain was
+// https and for a host the credential names.
+func TestCredentialAfterRedirects(t *testing.T) {
+	t.Parallel()
+
+	held := credential(t, "Bearer", "token", "registry.test", "mirror.test:8443", "registry.test:80")
+
+	// What a request before the last may be for, and whether the
+	// credential names it.
+	hops := map[string]bool{
+		"https://registry.test/":              true,
+		"https://REGISTRY.test:443/elsewhere": true,
+		"https://mirror.test:8443/":           true,
+		"https://mirror.test/":                false,
+		"https://foreign.test/":               false,
+		"https://sub.registry.test/":          false,
+		// Named, host and port, and cleartext: whoever is on the path
+		// wrote the redirect.
+		"http://registry.test/": false,
+	}
+
+	var walk func(chain []string, trusted bool, depth int)
+
+	walk = func(chain []string, trusted bool, depth int) {
+		addresses := append(slices.Clone(chain), "https://registry.test/v2/")
+		req := followed(t, addresses[0], addresses[1:]...)
+
+		want := ""
+		if trusted {
+			want = "Bearer token"
+		}
+
+		if got := authorization(t, req, held); got != want {
+			t.Errorf("after %q: Authorization %q, want %q", chain, got, want)
+		}
+
+		if depth == 0 {
+			return
+		}
+
+		for hop, named := range hops {
+			walk(append(slices.Clone(chain), hop), trusted && named, depth-1)
+		}
+	}
+
+	walk(nil, true, 3)
+}
+
+// TestCredentialAfterARedirectFromNowhere: a redirect whose response names
+// no request, or a request with no URL, tells nothing of where it came
+// from, and the token is withheld.
+func TestCredentialAfterARedirectFromNowhere(t *testing.T) {
+	t.Parallel()
+
+	held := credential(t, "Bearer", "token", "registry.test")
+
+	for what, via := range map[string]*http.Response{
+		"no request":            {StatusCode: http.StatusFound, Body: http.NoBody},
+		"a request with no URL": {StatusCode: http.StatusFound, Body: http.NoBody, Request: &http.Request{}},
+	} {
+		req := followed(t, "https://registry.test/")
+		req.Response = via
+
+		if got := authorization(t, req, held); got != "" {
+			t.Errorf("a redirect with %s: Authorization %q, want none", what, got)
+		}
+	}
+}
+
+// TestTheFirstCredentialForAHostDecides: when a redirect withholds the first
+// credential that names a host, no later one is sent in its place.
+func TestTheFirstCredentialForAHostDecides(t *testing.T) {
+	t.Parallel()
+
+	req := followed(t, "https://mirror.test/", "https://registry.test/")
+
+	got := authorization(
+		t,
+		req,
+		credential(t, "Bearer", "first", "registry.test"),
+		credential(t, "Bearer", "second", "registry.test", "mirror.test"),
+	)
+	if got != "" {
+		t.Errorf(
+			"Authorization %q, want none: the first credential for the host does not name where the redirect came from",
+			got,
+		)
+	}
+}
+
+// holder keeps a credential where fmt cannot ask it how it prints.
+type holder struct {
+	held xhttp.Credential
+	many []xhttp.Credential
+	at   *xhttp.Credential
+}
+
+// TestACredentialNeverPrintsItsToken: under every verb fmt has, alone, by
+// pointer, in a slice and inside a struct whose fields fmt reads without
+// asking them, through log/slog's two handlers and through encoding/json, a
+// credential is its scheme and its hosts.
+func TestACredentialNeverPrintsItsToken(t *testing.T) {
+	t.Parallel()
+
+	const secret = "s3cr3t-token"
+
+	held := credential(t, "Bearer", secret, "registry.test", "[::1]:8443")
+
+	var written strings.Builder
+
+	for _, verb := range "vsqdxXobcUeEfFgGtTp" {
+		for _, flag := range []string{"", "+", "#", " ", "0", "-", "8", ".3"} {
+			format := "%" + flag + string(verb) + "\n"
+
+			for _, value := range []any{
+				held, &held,
+				[]xhttp.Credential{held},
+				map[string]xhttp.Credential{"key": held},
+				holder{held: held, many: []xhttp.Credential{held}, at: &held},
+				&holder{held: held},
+			} {
+				fmt.Fprintf(&written, format, value)
+			}
+		}
+	}
+
+	fmt.Fprintln(&written, held, &held, holder{held: held})
+
+	for _, handler := range []slog.Handler{
+		slog.NewTextHandler(&written, nil),
+		slog.NewJSONHandler(&written, nil),
+	} {
+		slog.New(handler).Info("a credential", "held", held, "at", &held, "inside", holder{held: held})
+	}
+
+	encoded, err := json.Marshal(map[string]any{"held": held, "at": &held, "many": []xhttp.Credential{held}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	written.Write(encoded)
+
+	text := written.String()
+
+	if strings.Contains(text, secret) {
+		t.Errorf(
+			"the token was printed:\n%s",
+			text[max(0, strings.Index(text, secret)-200):strings.Index(text, secret)+len(secret)],
+		)
+	}
+
+	const shown = "Bearer credential for registry.test:443, [::1]:8443"
+
+	if got := fmt.Sprintf(
+		"%v|%+v|%#v|%s|%d",
+		held,
+		held,
+		&held,
+		held,
+		held,
+	); got != strings.Repeat(
+		shown+"|",
+		4,
+	)+shown {
+		t.Errorf("a credential prints as %q, want %q under each verb", got, shown)
+	}
+
+	if got := fmt.Sprint(xhttp.Credential{}); got != "credential for no host" {
+		t.Errorf("the zero Credential prints as %q", got)
 	}
 }
 

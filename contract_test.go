@@ -18,9 +18,29 @@ package xhttp_test
 //   - the caller's request is left as it was, and is the response's Request;
 //     a trailer the caller sets while the body is read is sent;
 //   - UserAgent is the User-Agent of a request that has no such header;
-//   - a Credential is sent to the hosts it names, over https, and to no
-//     other, a redirect's target included; a request's own Authorization
-//     header is kept; a credential with no token is not sent;
+//   - a Credential is made by NewCredential from a scheme that is an HTTP
+//     token (RFC 9110, 5.6.2 and 11.1), a token that net/http sends as it
+//     is in a header field (5.5: any octet but a control character other
+//     than a tab, and nothing blank at an end), and one host or more, each written in ASCII as a URL writes it
+//     (RFC 3986, 3.2.2: a name, an IPv4 address or an IPv6 address in
+//     brackets, alone or with a port; no zone, which RFC 6874 writes one
+//     way and net/url gives back another). Anything else is ErrCredential,
+//     and the error does not hold the token;
+//   - a credential goes with a request exactly when the request is https,
+//     its URL writes its host in ASCII, and net/http dials for it the
+//     address it dials for one of the credential's hosts over https: so not
+//     to another host, a redirect's target included, and not in cleartext.
+//     Of two credentials for a host the first is sent; a request's own
+//     Authorization header is kept; the zero Credential is never sent;
+//   - a request a client makes on a redirect (net/http: Request.Response is
+//     "the redirect response which caused this request to be created") gets
+//     the credential only when every request that led to it was https and
+//     for a host the credential names; when that withholds the first
+//     credential for a host, no other is sent;
+//   - a Credential prints as its scheme and its hosts and never as its
+//     token: under every verb of fmt, where fmt asks the value (fmt:
+//     Formatter) and where it reads the fields itself (a value in an
+//     unexported field), and so through log/slog and encoding/json;
 //   - Redirects follows at most its limit, and none from https to anything
 //     else: both are ErrRedirect;
 //   - an error that is not the posture's is the standard library's, unchanged.
@@ -588,7 +608,7 @@ func TestTheCallersRequestIsLeftAsItWas(t *testing.T) {
 		"a transport": bare,
 		"a transport with a credential": xhttp.Authorize(
 			bare,
-			xhttp.Credential{Token: "token", Hosts: []string{strings.TrimPrefix(server.URL, "https://")}},
+			credential(t, "Bearer", "token", strings.TrimPrefix(server.URL, "https://")),
 		),
 	} {
 		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, http.NoBody)
@@ -668,7 +688,8 @@ func TestUserAgent(t *testing.T) {
 
 // TestCredentialGoesToItsHostsOnly: the token reaches the host it names,
 // and not the host a redirect leads to, a host it does not name, or a server
-// in cleartext.
+// in cleartext; nor the host it names when another host sent the client
+// there. The redirects are net/http's own client's.
 func TestCredentialGoesToItsHostsOnly(t *testing.T) {
 	t.Parallel()
 
@@ -683,18 +704,32 @@ func TestCredentialGoesToItsHostsOnly(t *testing.T) {
 		}
 	}
 
-	other, roots := secure(t, record(&elsewhere), nil)
+	var back atomic.Pointer[string]
+
+	other, roots := secure(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/back" {
+			http.Redirect(w, r, *back.Load()+"/chosen-elsewhere", http.StatusTemporaryRedirect)
+
+			return
+		}
+
+		record(&elsewhere)(w, r)
+	}, nil)
 
 	first, _ := secure(t, func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/away":
 			http.Redirect(w, r, other.URL+"/asset", http.StatusFound)
+		case "/again":
+			http.Redirect(w, r, "/", http.StatusFound)
 		case "/own":
 			record(&own)(w, r)
 		default:
 			record(&named)(w, r)
 		}
 	}, nil)
+
+	back.Store(&first.URL)
 
 	plain := httptest.NewServer(record(&elsewhere))
 	t.Cleanup(plain.Close)
@@ -711,8 +746,7 @@ func TestCredentialGoesToItsHostsOnly(t *testing.T) {
 	client := &http.Client{
 		Transport: xhttp.Authorize(
 			xhttp.NewTransport(xhttp.Config{Roots: roots, Cleartext: true}),
-			xhttp.Credential{Hosts: []string{hostOf(first.URL), hostOf(other.URL), hostOf(plain.URL)}},
-			xhttp.Credential{Token: "for-the-first-host", Hosts: []string{hostOf(first.URL), hostOf(plain.URL)}},
+			credential(t, "Bearer", "for-the-first-host", hostOf(first.URL), hostOf(plain.URL)),
 		),
 	}
 
@@ -734,7 +768,9 @@ func TestCredentialGoesToItsHostsOnly(t *testing.T) {
 	}{
 		{"the named host", first.URL + "/", &named, token},
 		{"a redirect to another host", first.URL + "/away", &elsewhere, ""},
-		{"a host only a credential with no token names", other.URL, &elsewhere, ""},
+		{"a host no credential names", other.URL, &elsewhere, ""},
+		{"a redirect within the named host", first.URL + "/again", &named, token},
+		{"the named host, on a redirect from a host that is not named", other.URL + "/back", &named, ""},
 		{"a named host in cleartext", plain.URL, &elsewhere, ""},
 	} {
 		if _, err := get(t.Context(), t, client, step.address); err != nil {
@@ -828,7 +864,7 @@ func TestATrailerSetWhileTheBodyIsReadIsSent(t *testing.T) {
 		"a transport": bare,
 		"a transport with a credential": xhttp.Authorize(
 			bare,
-			xhttp.Credential{Token: "token", Hosts: []string{strings.TrimPrefix(server.URL, "https://")}},
+			credential(t, "Bearer", "token", strings.TrimPrefix(server.URL, "https://")),
 		),
 	} {
 		req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, server.URL, http.NoBody)
