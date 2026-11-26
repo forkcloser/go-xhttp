@@ -10,8 +10,9 @@ package xhttp_test
 //     transport is made;
 //   - Offline fails every request with ErrOffline, and nothing is dialed;
 //   - a request the posture refuses has its body closed, as RoundTrip must;
-//   - a read of a response body that waits longer than StallTimeout for a
-//     byte fails with ErrStalled, over HTTP/1 and HTTP/2, and with neither
+//   - a request whose response has not begun StallTimeout after it was
+//     sent fails with ErrStalled, as does a read of a response body that
+//     waits that long for a byte, over HTTP/1 and HTTP/2, and with neither
 //     of the context's errors, since nothing of the caller's ended; an
 //     error of that body afterwards is its own; the time between
 //     two reads is not counted; a negative StallTimeout waits for ever; a
@@ -65,6 +66,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -420,37 +422,241 @@ func TestStalledBody(t *testing.T) {
 	})
 }
 
+// TestAResponseThatDoesNotBegin: a server that takes a request and says
+// nothing fails it with ErrStalled once StallTimeout has passed, and with
+// neither of the context's errors; under a negative StallTimeout it is
+// waited for.
+func TestAResponseThatDoesNotBegin(t *testing.T) {
+	t.Parallel()
+
+	const stall = 200 * time.Millisecond
+
+	versions(t, func(t *testing.T, _ int, serve func(http.Handler) (string, xhttp.Config)) {
+		t.Helper()
+
+		release := make(chan struct{})
+
+		address, config := serve(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			wait := release
+			if r.URL.Path == "/late" {
+				wait = nil
+			}
+
+			select {
+			case <-wait:
+			case <-time.After(3 * stall):
+				if wait == nil {
+					_, _ = w.Write([]byte("content"))
+				}
+			case <-r.Context().Done():
+			}
+		}))
+
+		t.Cleanup(func() { close(release) })
+
+		config.StallTimeout = stall
+		limited := xhttp.NewClient(config)
+
+		// Far past the limit: what ends a request the limit did not.
+		ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+		defer cancel()
+
+		for _, path := range []string{"/never", "/late"} {
+			started := time.Now()
+
+			_, err := get(ctx, t, limited, address+path)
+			if !errors.Is(err, xhttp.ErrStalled) || errors.Is(err, context.Canceled) ||
+				errors.Is(err, context.DeadlineExceeded) {
+				t.Errorf("%s: %v, want ErrStalled and no error of a context", path, err)
+			}
+
+			// A timer never fires early.
+			if waited := time.Since(started); waited < stall {
+				t.Errorf("%s: failed after %v, before the %v of the limit", path, waited, stall)
+			}
+		}
+
+		config.StallTimeout = -1
+
+		if status, err := get(t.Context(), t, xhttp.NewClient(config), address+"/late"); err != nil ||
+			status != http.StatusOK {
+			t.Errorf("with no limit, a response that begins late: %d, %v; want 200", status, err)
+		}
+	})
+}
+
+// lingering is a request body whose one read takes a while.
+type lingering struct {
+	wait time.Duration
+	done bool
+}
+
+func (b *lingering) Read(into []byte) (int, error) {
+	if b.done {
+		return 0, io.EOF
+	}
+
+	time.Sleep(b.wait)
+
+	b.done = true
+
+	return copy(into, "content"), nil
+}
+
+func (*lingering) Close() error { return nil }
+
+// TestAnAnswerEndsTheWaitForIt: a server may answer before it has the whole
+// request, and net/http then finishes sending the request on its own. The
+// end of that sending starts no wait: the response is read to its end, past
+// the limit, as long as it keeps arriving.
+func TestAnAnswerEndsTheWaitForIt(t *testing.T) {
+	t.Parallel()
+
+	const (
+		stall  = 300 * time.Millisecond
+		pieces = 12
+	)
+
+	versions(t, func(t *testing.T, _ int, serve func(http.Handler) (string, xhttp.Config)) {
+		t.Helper()
+
+		address, config := serve(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			control := http.NewResponseController(w)
+			_ = control.EnableFullDuplex()
+
+			// Before the request's body has come, and for twice the limit.
+			for range pieces {
+				_, _ = w.Write([]byte("piece "))
+				_ = control.Flush()
+
+				select {
+				case <-time.After(stall / 6):
+				case <-r.Context().Done():
+					return
+				}
+			}
+		}))
+
+		config.StallTimeout = stall
+
+		// The body is sent a third of the limit after the answer began.
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, address, &lingering{wait: stall / 3})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		resp, err := xhttp.NewTransport(config).RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		content, err := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+
+		if err != nil || string(content) != strings.Repeat("piece ", pieces) {
+			t.Errorf("read %q, %v; want the %d pieces of the response", content, err, pieces)
+		}
+	})
+}
+
 // TestTheZeroConfigWatchesForAStall: the protection is on when nothing is
-// said, at the minute the docs give. It takes that long to see.
+// said, at the minute the docs give, for a body that stops and for a
+// response that never begins; and one that begins after 35 seconds is waited
+// for, which no limit shorter than the minute would allow. It takes a minute
+// to see, and the three run in that one minute.
 func TestTheZeroConfigWatchesForAStall(t *testing.T) {
 	t.Parallel()
 
-	release := make(chan struct{})
+	const late = 35 * time.Second
 
-	server, roots := secure(t, stalling(nil, release), nil)
+	release := make(chan struct{})
+	stops := stalling(nil, release)
+
+	server, roots := secure(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/stops":
+			stops(w, r)
+		case "/late":
+			select {
+			case <-time.After(late):
+				_, _ = w.Write([]byte("content"))
+			case <-r.Context().Done():
+			}
+		default:
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		}
+	}, nil)
 
 	t.Cleanup(func() { close(release) })
 
-	resp := open(t, xhttp.NewClient(xhttp.Config{Roots: roots}), server.URL+"/stops", 1)
-	started := time.Now()
+	client := xhttp.NewClient(xhttp.Config{Roots: roots})
 
-	content, err := io.ReadAll(resp.Body)
-	_ = resp.Body.Close()
+	// A timer never fires early; a clock here may start a moment after the
+	// wait it measures. It may fire late, by what a loaded machine adds, and
+	// no later.
+	aMinute := func(what string, started time.Time) {
+		t.Helper()
 
-	if !errors.Is(err, xhttp.ErrStalled) || string(content) != "first" {
-		t.Fatalf(
-			"a body that stops, under the zero Config: read %q, %v; want what arrived and ErrStalled",
-			content,
-			err,
-		)
+		if waited := time.Since(started); waited < time.Minute-time.Second || waited > time.Minute+15*time.Second {
+			t.Errorf("%s failed after %v, want a minute", what, waited)
+		}
 	}
 
-	// A timer never fires early; the first bytes may have come a moment
-	// before the clock here started. It may fire late, by what a loaded
-	// machine adds, and no later.
-	if waited := time.Since(started); waited < time.Minute-time.Second || waited > time.Minute+15*time.Second {
-		t.Errorf("the read failed after %v, want a minute", waited)
+	// Not get, which ends the test from the goroutine it is called on.
+	fetch := func(path string) (int, error) {
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL+path, http.NoBody)
+		if err != nil {
+			return 0, err
+		}
+
+		resp, err := client.Do(req)
+		if err != nil {
+			return 0, err
+		}
+
+		_, err = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+
+		return resp.StatusCode, err
 	}
+
+	stopped := open(t, client, server.URL+"/stops", 1)
+
+	var group sync.WaitGroup
+
+	group.Go(func() {
+		started := time.Now()
+
+		content, err := io.ReadAll(stopped.Body)
+		_ = stopped.Body.Close()
+
+		if !errors.Is(err, xhttp.ErrStalled) || string(content) != "first" {
+			t.Errorf("a body that stops: read %q, %v; want what arrived and ErrStalled", content, err)
+		}
+
+		aMinute("the read of a body that stops", started)
+	})
+
+	group.Go(func() {
+		started := time.Now()
+
+		if _, err := fetch("/never"); !errors.Is(err, xhttp.ErrStalled) {
+			t.Errorf("a response that never begins: %v, want ErrStalled", err)
+		}
+
+		aMinute("a request with no response", started)
+	})
+
+	group.Go(func() {
+		if status, err := fetch("/late"); err != nil || status != http.StatusOK {
+			t.Errorf("a response that begins after %v: %d, %v; want 200", late, status, err)
+		}
+	})
+
+	group.Wait()
 }
 
 // TestANegativeStallTimeoutWaitsForEver: a body that pauses is a stall under

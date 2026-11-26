@@ -9,6 +9,8 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/http/httptrace"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -22,7 +24,6 @@ const (
 	dialTimeout           = 30 * time.Second
 	dialKeepAlive         = 30 * time.Second
 	tlsHandshakeTimeout   = 10 * time.Second
-	responseHeaderTimeout = 30 * time.Second
 	idleConnTimeout       = 90 * time.Second
 	expectContinueTimeout = time.Second
 	// An HTTP/2 connection silent for pingAfter is pinged, and closed when
@@ -37,7 +38,7 @@ const (
 
 type transport struct {
 	base      *http.Transport
-	stall     time.Duration // zero: a read of a body waits for ever
+	stall     time.Duration // zero: the server's silence is never an error
 	userAgent string
 	cleartext bool
 	offline   bool
@@ -64,7 +65,6 @@ func NewTransport(config Config) http.RoundTripper {
 			ForceAttemptHTTP2:     true,
 			TLSClientConfig:       tlsConfig(config),
 			TLSHandshakeTimeout:   tlsHandshakeTimeout,
-			ResponseHeaderTimeout: responseHeaderTimeout,
 			IdleConnTimeout:       idleConnTimeout,
 			ExpectContinueTimeout: expectContinueTimeout,
 			MaxIdleConns:          maxIdleConns,
@@ -119,9 +119,12 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, fmt.Errorf("%w: %s://%s", ErrCleartext, req.URL.Scheme, req.URL.Host)
 	}
 
-	// A body's read is cut short by cancelling the request, the one thing
-	// that unblocks a read on a connection gone quiet.
+	// A wait for the server is cut short by cancelling the request, which
+	// is what unblocks a transport waiting on a connection gone quiet.
 	ctx, cancel := context.WithCancelCause(req.Context())
+
+	awaited := await(cancel, t.stall)
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: awaited.sent})
 
 	// A RoundTripper leaves the caller's request as it is. Not Request.Clone:
 	// it copies Trailer, which a caller fills while the body is read.
@@ -133,8 +136,18 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	resp, err := t.base.RoundTrip(sent)
+
+	awaited.answered()
+
 	if err != nil {
 		cancel(nil)
+
+		// Whatever the transport made of the cancelled request: over HTTP/2
+		// that is the context's error, of a context that is not the
+		// caller's.
+		if errors.Is(context.Cause(ctx), ErrStalled) {
+			return nil, fmt.Errorf("%w: the request was sent, and no response began", ErrStalled)
+		}
 
 		return nil, refused(err)
 	}
@@ -178,6 +191,45 @@ func refused(err error) error {
 	}
 
 	return err
+}
+
+// awaiting fails a request whose response does not begin within limit of the
+// request having been sent. A limit of zero waits for ever.
+type awaiting struct {
+	limit time.Duration
+
+	mu    sync.Mutex
+	timer *time.Timer
+	// over is set once RoundTrip has its answer: net/http may still be
+	// writing the request then, and what it reports is no longer waited on.
+	over bool
+}
+
+func await(cancel context.CancelCauseFunc, limit time.Duration) *awaiting {
+	timer := time.AfterFunc(time.Duration(math.MaxInt64), func() { cancel(ErrStalled) })
+	timer.Stop()
+
+	return &awaiting{limit: limit, timer: timer}
+}
+
+// sent is httptrace's WroteRequest: the request is written, or could not be,
+// and the wait for the response starts.
+func (a *awaiting) sent(httptrace.WroteRequestInfo) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	if a.limit != 0 && !a.over {
+		a.timer.Reset(a.limit)
+	}
+}
+
+// answered ends the wait: the response began, or the request failed.
+func (a *awaiting) answered() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+
+	a.over = true
+	a.timer.Stop()
 }
 
 // watchedBody fails a read that waits longer than limit for a byte. The time
