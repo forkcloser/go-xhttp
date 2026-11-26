@@ -1,7 +1,6 @@
 package xhttp
 
 import (
-	"crypto/tls"
 	"crypto/x509"
 	"fmt"
 	"net/http"
@@ -16,8 +15,6 @@ type Config struct {
 	KeyExchange KeyExchange
 	// Roots is the certificate authorities trusted; the system's when nil.
 	Roots *x509.CertPool
-	// Certificates is what the client presents to a server that asks.
-	Certificates []tls.Certificate
 	// Proxy picks a request's proxy; http.ProxyFromEnvironment when nil.
 	Proxy func(*http.Request) (*url.URL, error)
 	// StallTimeout is how long the server may stay silent: before it takes

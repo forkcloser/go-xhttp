@@ -80,10 +80,8 @@ func NewTransport(config Config) http.RoundTripper {
 }
 
 func tlsConfig(config Config) *tls.Config {
-	made := &tls.Config{ // #nosec G402 -- Legacy is Go's own floor, and a transport gets it only by name
-		RootCAs:      config.Roots,
-		Certificates: config.Certificates,
-	}
+	// #nosec G402 -- Legacy is Go's own floor, and a transport gets it only by name
+	made := &tls.Config{RootCAs: config.Roots}
 
 	switch config.KeyExchange {
 	case HybridOnly:
