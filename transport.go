@@ -139,8 +139,8 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		return nil, refused(err)
 	}
 
-	// The copy's context ends when the body is closed: the caller's own
-	// request is the one it gets back.
+	// The copy's context ends with the body: the caller's own request is the
+	// one it gets back.
 	resp.Request = req
 
 	switch stream, switched := resp.Body.(io.ReadWriteCloser); {
@@ -183,12 +183,12 @@ func refused(err error) error {
 // watchedBody fails a read that waits longer than limit for a byte. The time
 // a caller takes between two reads is its own, and is not counted.
 type watchedBody struct {
+	// A released body, which lets go of ctx.
 	io.ReadCloser
 
 	limit  time.Duration
 	timer  *time.Timer
 	ctx    context.Context //nolint:containedctx // the request's, kept to read why a read failed
-	cancel context.CancelCauseFunc
 	closed atomic.Bool
 }
 
@@ -199,7 +199,7 @@ func watch(ctx context.Context, cancel context.CancelCauseFunc, body io.ReadClos
 	timer := time.AfterFunc(time.Duration(math.MaxInt64), func() { cancel(ErrStalled) })
 	timer.Stop()
 
-	return &watchedBody{ReadCloser: body, limit: limit, timer: timer, ctx: ctx, cancel: cancel}
+	return &watchedBody{ReadCloser: &released{ReadCloser: body, cancel: cancel}, limit: limit, timer: timer, ctx: ctx}
 }
 
 func (b *watchedBody) Read(buf []byte) (int, error) {
@@ -218,7 +218,8 @@ func (b *watchedBody) Read(buf []byte) (int, error) {
 	// else, whatever the body says: over HTTP/2 that is the error of the
 	// context cancelled, which is this transport's own and no context of
 	// the caller's, and over HTTP/1 a second read finds a closed connection.
-	// A body the caller has closed says so itself.
+	// A body the caller has closed says so itself. The cause read here is
+	// the first one given: the release at a read's error comes after it.
 	if !b.closed.Load() && errors.Is(context.Cause(b.ctx), ErrStalled) {
 		return read, ErrStalled
 	}
@@ -230,19 +231,24 @@ func (b *watchedBody) Close() error {
 	b.closed.Store(true)
 	b.timer.Stop()
 
-	err := b.ReadCloser.Close()
-
-	b.cancel(nil)
-
-	return err //nolint:wrapcheck // the body's own error, unchanged
+	return b.ReadCloser.Close() //nolint:wrapcheck // the body's own error, unchanged
 }
 
-// released is a body nothing watches, which releases the request's context
-// when closed.
+// released is a body that releases the request's context at its end, as
+// net/http's transport releases its own, or when it is closed.
 type released struct {
 	io.ReadCloser
 
 	cancel context.CancelCauseFunc
+}
+
+func (r *released) Read(buf []byte) (int, error) {
+	read, err := r.ReadCloser.Read(buf)
+	if err != nil {
+		r.cancel(nil)
+	}
+
+	return read, err //nolint:wrapcheck // the body's own error, unchanged
 }
 
 func (r *released) Close() error {

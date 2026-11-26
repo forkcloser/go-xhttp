@@ -17,6 +17,10 @@ package xhttp_test
 //     two reads is not counted; a negative StallTimeout waits for ever; a
 //     Close from another goroutine ends a read; the connection a protocol
 //     switch hands over is not watched;
+//   - a response body read to its end holds nothing of the request any
+//     more, closed or not, as under net/http's own transport (net/http,
+//     Response.Body: "It is the caller's responsibility to close Body", and
+//     its transport lets go of the request at the body's end all the same);
 //   - the caller's request is left as it was, and is the response's Request;
 //     a trailer the caller sets while the body is read is sent;
 //   - UserAgent is the User-Agent of a request that has no such header;
