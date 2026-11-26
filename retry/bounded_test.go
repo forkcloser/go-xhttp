@@ -3,13 +3,15 @@ package retry_test
 // The walk within the bound: every method of RFC 9110 and one outside it,
 // with and without each idempotency key, against a status and an error;
 // every status from 100 to 599; every form of Retry-After, at MaxBackoff and
-// one second past it; the wait before each of the first retries.
+// one second past it; the wait before each of the first retries. The waits
+// are on testing/synctest's clock, where they are exact and take no time.
 
 import (
 	"net/http"
 	"slices"
 	"strconv"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/forkcloser/xhttp/retry"
@@ -95,52 +97,150 @@ func TestStatuses(t *testing.T) {
 	}
 }
 
-// TestRetryAfter: what a Retry-After asks for is waited when it is longer
-// than the backoff and no longer than MaxBackoff; past MaxBackoff the
-// response comes back; what is no number of seconds and no date asks for
-// nothing.
+// clocked sends one GET for each round through a transport with options,
+// over a base that answers from script, on testing/synctest's clock: time
+// passes in the transport's own waits and nowhere else, so each wait is
+// exact. It returns the waits of each round, one before each retry.
+func clocked(t *testing.T, rounds int, options retry.Options, script []answer) [][]time.Duration {
+	t.Helper()
+
+	waited := make([][]time.Duration, 0, rounds)
+
+	synctest.Test(t, func(t *testing.T) {
+		for range rounds {
+			base := &scripted{script: script}
+
+			if _, err := send(t, base, options, http.MethodGet, nil); err != nil {
+				t.Fatal(err)
+			}
+
+			sent := base.attempts()
+			round := make([]time.Duration, 0, len(sent))
+
+			for index := range len(sent) - 1 {
+				round = append(round, sent[index+1].at.Sub(sent[index].at))
+			}
+
+			waited = append(waited, round)
+		}
+	})
+
+	return waited
+}
+
+// before is the wait before the nth retry, the first being 1, in every
+// round.
+func before(t *testing.T, waited [][]time.Duration, nth int) []time.Duration {
+	t.Helper()
+
+	waits := make([]time.Duration, 0, len(waited))
+
+	for _, round := range waited {
+		if len(round) < nth {
+			t.Fatalf("a round made %d retries, want %d at least", len(round), nth)
+		}
+
+		waits = append(waits, round[nth-1])
+	}
+
+	return waits
+}
+
+// drawn holds every wait to no less than least and to under most, and to
+// both ends of that: of several hundred waits drawn evenly, one comes within
+// a tenth of each end.
+func drawn(t *testing.T, what string, waits []time.Duration, least, most time.Duration) {
+	t.Helper()
+
+	lowest, highest, margin := slices.Min(waits), slices.Max(waits), (most-least)/10
+
+	if lowest < least || highest >= most {
+		t.Errorf("%s: the waits go from %v to %v, want all from %v and under %v", what, lowest, highest, least, most)
+	}
+
+	if lowest > least+margin || highest < most-margin {
+		t.Errorf("%s: the waits go from %v to %v, and do not reach both ends of %v to %v",
+			what, lowest, highest, least, most)
+	}
+}
+
+// capped holds every wait to at least least and at most most, which some
+// reach, as some come within a tenth of least.
+func capped(t *testing.T, what string, waits []time.Duration, least, most time.Duration) {
+	t.Helper()
+
+	lowest, highest := slices.Min(waits), slices.Max(waits)
+
+	if lowest < least || lowest > least+(most-least)/10 || highest != most {
+		t.Errorf("%s: the waits go from %v to %v, want from %v to %v", what, lowest, highest, least, most)
+	}
+}
+
+// TestRetryAfter: what a Retry-After asks for is waited, to the nanosecond,
+// when it is longer than the backoff and no longer than MaxBackoff; past
+// MaxBackoff the response comes back; what is no number of seconds and no
+// date asks for nothing, and the wait is the backoff's.
 func TestRetryAfter(t *testing.T) {
 	t.Parallel()
 
-	const longest = 2 * time.Second
+	const (
+		first   = time.Millisecond
+		longest = 2 * time.Second
+	)
 
-	date := func(in time.Duration) string { return time.Now().Add(in).UTC().Format(http.TimeFormat) }
+	text := func(value string) func() string { return func() string { return value } }
+	in := func(wait time.Duration, layout string) func() string {
+		return func() string { return time.Now().Add(wait).UTC().Format(layout) }
+	}
 
-	for name, header := range map[string]struct {
-		value string
+	cases := map[string]struct {
+		value func() string
 		again bool
-		least time.Duration
+		asked time.Duration
 	}{
-		"no seconds":                     {"0", true, 0},
-		"one second":                     {"1", true, time.Second},
-		"MaxBackoff":                     {"2", true, 2 * time.Second},
-		"a second past MaxBackoff":       {"3", false, 0},
-		"an hour":                        {"3600", false, 0},
-		"past what a duration holds":     {"9223372037", false, 0},
-		"the largest 64-bit number":      {"18446744073709551615", false, 0},
-		"past what 64 bits hold":         {"18446744073709551616", false, 0},
-		"a date in the past":             {date(-time.Hour), true, 0},
-		"a date an hour away":            {date(time.Hour), false, 0},
-		"a negative number":              {"-1", true, 0},
-		"a fraction":                     {"1.5", true, 0},
-		"a number with a unit":           {"1s", true, 0},
-		"words":                          {"later", true, 0},
-		"an obsolete date, RFC 850":      {time.Now().Add(-time.Hour).UTC().Format(time.RFC850), true, 0},
-		"an obsolete date, asctime":      {time.Now().Add(-time.Hour).UTC().Format(time.ANSIC), true, 0},
-		"a date a moment within the max": {date(1500 * time.Millisecond), true, 0},
-	} {
-		t.Run(name, func(t *testing.T) {
-			t.Parallel()
+		"no header value":                  {text(""), true, 0},
+		"no seconds":                       {text("0"), true, 0},
+		"one second":                       {text("1"), true, time.Second},
+		"one second, with zeros before":    {text("0001"), true, time.Second},
+		"MaxBackoff":                       {text("2"), true, 2 * time.Second},
+		"a second past MaxBackoff":         {text("3"), false, 0},
+		"an hour":                          {text("3600"), false, 0},
+		"past what a duration holds":       {text("9223372037"), false, 0},
+		"the largest 64-bit number":        {text("18446744073709551615"), false, 0},
+		"past what 64 bits hold":           {text("18446744073709551616"), false, 0},
+		"a negative number":                {text("-1"), true, 0},
+		"a fraction":                       {text("1.5"), true, 0},
+		"a number with a unit":             {text("1s"), true, 0},
+		"words":                            {text("later"), true, 0},
+		"a date in the past":               {in(-time.Hour, http.TimeFormat), true, 0},
+		"a date that is now":               {in(0, http.TimeFormat), true, 0},
+		"a date a second away":             {in(time.Second, http.TimeFormat), true, time.Second},
+		"a date at MaxBackoff":             {in(2*time.Second, http.TimeFormat), true, 2 * time.Second},
+		"a date a second past MaxBackoff":  {in(3*time.Second, http.TimeFormat), false, 0},
+		"a date an hour away":              {in(time.Hour, http.TimeFormat), false, 0},
+		"an obsolete date, RFC 850":        {in(-time.Hour, time.RFC850), true, 0},
+		"an obsolete date, asctime":        {in(-time.Hour, time.ANSIC), true, 0},
+		"RFC 850, a second away":           {in(time.Second, time.RFC850), true, time.Second},
+		"asctime, a second away":           {in(time.Second, time.ANSIC), true, time.Second},
+		"asctime, a second past the limit": {in(3*time.Second, time.ANSIC), false, 0},
+	}
 
+	synctest.Test(t, func(t *testing.T) {
+		for name, header := range cases {
+			// From a whole second: a date is written to the second, and
+			// what it asks for is counted from the moment it is read.
+			time.Sleep(time.Until(time.Now().Truncate(time.Second).Add(time.Second)))
+
+			value := header.value()
 			base := &scripted{script: failing(1, answer{
 				status: http.StatusTooManyRequests,
-				header: http.Header{"Retry-After": {header.value}},
+				header: http.Header{"Retry-After": {value}},
 			})}
 
 			status, err := send(
 				t,
 				base,
-				retry.Options{Retries: 1, Backoff: time.Millisecond, MaxBackoff: longest},
+				retry.Options{Retries: 1, Backoff: first, MaxBackoff: longest},
 				http.MethodGet,
 				nil,
 			)
@@ -152,38 +252,30 @@ func TestRetryAfter(t *testing.T) {
 
 			if !header.again {
 				if status != http.StatusTooManyRequests || len(sent) != 1 {
-					t.Fatalf(
-						"Retry-After %q: %d after %d attempts; want the 429 after 1",
-						header.value,
-						status,
-						len(sent),
-					)
+					t.Errorf("%s, %q: %d after %d attempts; want the 429 after 1", name, value, status, len(sent))
 				}
 
-				return
+				continue
 			}
 
 			if status != http.StatusOK || len(sent) != 2 {
-				t.Fatalf("Retry-After %q: %d after %d attempts; want 200 after 2", header.value, status, len(sent))
+				t.Errorf("%s, %q: %d after %d attempts; want 200 after 2", name, value, status, len(sent))
+
+				continue
 			}
 
-			// A timer never fires early, so the least wait is exact; the most is
-			// MaxBackoff and what the machine adds, bounded loosely.
-			if waited := sent[1].at.Sub(sent[0].at); waited < header.least || waited > longest+20*time.Second {
-				t.Errorf(
-					"Retry-After %q: waited %v, want at least %v and about %v at most",
-					header.value,
-					waited,
-					header.least,
-					longest,
-				)
+			switch waited := sent[1].at.Sub(sent[0].at); {
+			case header.asked == 0 && (waited < first*3/4 || waited >= first*5/4):
+				t.Errorf("%s, %q: waited %v, want the backoff's %v, a quarter less or more", name, value, waited, first)
+			case header.asked != 0 && waited != header.asked:
+				t.Errorf("%s, %q: waited %v, want %v", name, value, waited, header.asked)
 			}
-		})
-	}
+		}
+	})
 }
 
-// TestBackoff: the wait before each retry is at least three quarters of
-// Backoff doubled each time, and MaxBackoff once that is reached.
+// TestBackoff: the wait before each retry is drawn between three quarters
+// and five quarters of Backoff doubled each time, and is MaxBackoff at most.
 func TestBackoff(t *testing.T) {
 	t.Parallel()
 
@@ -191,95 +283,80 @@ func TestBackoff(t *testing.T) {
 		first   = 40 * time.Millisecond
 		longest = 100 * time.Millisecond
 		retries = 4
+		rounds  = 500
 	)
 
-	base := &scripted{script: failing(retries, answer{err: errFlaky})}
-
-	if status, err := send(
+	waited := clocked(
 		t,
-		base,
+		rounds,
 		retry.Options{Retries: retries, Backoff: first, MaxBackoff: longest},
-		http.MethodGet,
-		nil,
-	); err != nil ||
-		status != http.StatusOK {
-		t.Fatalf("%d, %v; want 200", status, err)
-	}
+		failing(retries, answer{err: errFlaky}),
+	)
 
-	sent := base.attempts()
-	if len(sent) != retries+1 {
-		t.Fatalf("%d attempts, want %d", len(sent), retries+1)
-	}
-
-	// 40ms, 80ms, then 160ms and 320ms cut to the 100ms of MaxBackoff; a
-	// quarter less at most, and a timer never fires early.
-	for index, least := range []time.Duration{30 * time.Millisecond, 60 * time.Millisecond, 75 * time.Millisecond, 75 * time.Millisecond} {
-		if waited := sent[index+1].at.Sub(sent[index].at); waited < least {
-			t.Errorf("the wait before retry %d was %v, want %v at least", index+1, waited, least)
-		}
-	}
-
-	// Four waits of MaxBackoff at most, and what the machine adds, bounded loosely.
-	if whole := sent[retries].at.Sub(sent[0].at); whole > retries*longest+20*time.Second {
-		t.Errorf("the %d retries took %v, with waits of %v at most", retries, whole, longest)
-	}
+	// 40ms, 80ms, then 160ms and 320ms cut to the 100ms of MaxBackoff.
+	drawn(t, "retry 1", before(t, waited, 1), 30*time.Millisecond, 50*time.Millisecond)
+	drawn(t, "retry 2", before(t, waited, 2), 60*time.Millisecond, 100*time.Millisecond)
+	capped(t, "retry 3", before(t, waited, 3), 75*time.Millisecond, longest)
+	capped(t, "retry 4", before(t, waited, 4), 75*time.Millisecond, longest)
 }
 
-// TestBackoffAtTheEdges: a Backoff past MaxBackoff waits as MaxBackoff does,
-// and the largest durations double into no negative wait.
+// TestBackoffAtTheEdges: a Backoff past MaxBackoff waits as MaxBackoff does;
+// the largest MaxBackoff leaves the first waits as they are; and a wait
+// doubled more times than a duration has bits is still MaxBackoff's.
 func TestBackoffAtTheEdges(t *testing.T) {
 	t.Parallel()
 
 	const (
 		longest = 20 * time.Millisecond
-		least   = 15 * time.Millisecond // a quarter less than MaxBackoff
+		largest = time.Duration(1<<63 - 1)
+		rounds  = 500
 	)
 
 	for name, backoff := range map[string]time.Duration{
 		"a Backoff past MaxBackoff": time.Hour,
-		"the largest Backoff":       time.Duration(1<<63 - 1),
+		"the largest Backoff":       largest,
 	} {
-		base := &scripted{script: failing(3, answer{err: errFlaky})}
-
-		if status, err := send(
+		waited := clocked(
 			t,
-			base,
-			retry.Options{Retries: 3, Backoff: backoff, MaxBackoff: longest},
-			http.MethodGet,
-			nil,
-		); err != nil ||
-			status != http.StatusOK {
-			t.Fatalf("%s: %d, %v; want 200", name, status, err)
-		}
+			rounds,
+			retry.Options{Retries: 2, Backoff: backoff, MaxBackoff: longest},
+			failing(2, answer{err: errFlaky}),
+		)
 
-		sent := base.attempts()
-		for index := range len(sent) - 1 {
-			if waited := sent[index+1].at.Sub(sent[index].at); waited < least {
-				t.Errorf("%s: the wait before retry %d was %v, want %v at least", name, index+1, waited, least)
-			}
-		}
+		capped(t, name+", retry 1", before(t, waited, 1), longest*3/4, longest)
+		capped(t, name+", retry 2", before(t, waited, 2), longest*3/4, longest)
 	}
 
-	// The largest MaxBackoff, where a jittered wait would not fit a duration:
-	// the wait is still the Backoff's, not a negative one that does not wait.
-	base := &scripted{script: failing(2, answer{err: errFlaky})}
-	options := retry.Options{Retries: 2, Backoff: 20 * time.Millisecond, MaxBackoff: time.Duration(1<<63 - 1)}
+	waited := clocked(
+		t,
+		rounds,
+		retry.Options{Retries: 2, Backoff: 20 * time.Millisecond, MaxBackoff: largest},
+		failing(2, answer{err: errFlaky}),
+	)
 
-	if status, err := send(t, base, options, http.MethodGet, nil); err != nil || status != http.StatusOK {
-		t.Fatalf("the largest MaxBackoff: %d, %v; want 200", status, err)
+	drawn(t, "the largest MaxBackoff, retry 1", before(t, waited, 1), 15*time.Millisecond, 25*time.Millisecond)
+	drawn(t, "the largest MaxBackoff, retry 2", before(t, waited, 2), 30*time.Millisecond, 50*time.Millisecond)
+
+	// A millisecond doubled 79 times is past what a duration holds, and
+	// past it twice over.
+	const doublings = 80
+
+	waited = clocked(
+		t,
+		rounds/10,
+		retry.Options{Retries: doublings, Backoff: time.Millisecond, MaxBackoff: longest},
+		failing(doublings, answer{err: errFlaky}),
+	)
+
+	// 16ms is the last wait under MaxBackoff: every wait after it, of every
+	// round, is MaxBackoff's.
+	var late []time.Duration
+
+	for nth := 6; nth <= doublings; nth++ {
+		late = append(late, before(t, waited, nth)...)
 	}
 
-	sent := base.attempts()
-	for index, floor := range []time.Duration{15 * time.Millisecond, 30 * time.Millisecond} {
-		if waited := sent[index+1].at.Sub(sent[index].at); waited < floor {
-			t.Errorf(
-				"the largest MaxBackoff: the wait before retry %d was %v, want %v at least",
-				index+1,
-				waited,
-				floor,
-			)
-		}
-	}
+	capped(t, "retries 6 to 80", late, longest*3/4, longest)
 }
 
 // TestRetries: a request is sent again Retries times, and no more.
@@ -297,53 +374,33 @@ func TestRetries(t *testing.T) {
 	}
 }
 
-// TestTheDefaults: Options that name no Backoff wait about half a second,
-// held loosely, and Options that name no MaxBackoff obey a
-// Retry-After of 30 seconds and none of 31, as the docs say. The 30 seconds
-// are waited for real: nothing shorter tells them from 29.
+// TestTheDefaults: Options that name no Backoff wait half a second, a
+// quarter less or more, and Options that name no MaxBackoff obey a
+// Retry-After of 30 seconds and none of 31, as the docs say.
 func TestTheDefaults(t *testing.T) {
 	t.Parallel()
 
-	base := &scripted{script: failing(1, answer{err: errFlaky})}
+	const rounds = 500
 
-	if status, err := send(
-		t,
-		base,
-		retry.Options{Retries: 1},
-		http.MethodGet,
-		nil,
-	); err != nil ||
-		status != http.StatusOK {
-		t.Fatalf("%d, %v; want 200", status, err)
-	}
+	waited := clocked(t, rounds, retry.Options{Retries: 1}, failing(1, answer{err: errFlaky}))
 
-	// One wait is all a test sees, and it is jittered: half a second gives
-	// between 375 and 625 milliseconds. A timer never fires early, and fires
-	// late by what a loaded machine adds, so the upper bound is loose. What
-	// this always catches is a default under 300 milliseconds or over 2.7
-	// seconds; between the two, a changed default may pass.
-	sent := base.attempts()
-	if waited := sent[1].at.Sub(sent[0].at); waited < 375*time.Millisecond || waited > 2*time.Second {
-		t.Errorf("with no Backoff named the wait was %v, want half a second, a quarter less or more", waited)
-	}
+	drawn(t, "no Backoff named", before(t, waited, 1), 375*time.Millisecond, 625*time.Millisecond)
 
 	for asked, again := range map[time.Duration]bool{
+		29 * time.Second: true,
 		30 * time.Second: true,
 		31 * time.Second: false,
 	} {
-		base = &scripted{script: failing(1, answer{
+		waited = clocked(t, 1, retry.Options{Retries: 1, Backoff: time.Millisecond}, failing(1, answer{
 			status: http.StatusServiceUnavailable,
 			header: http.Header{"Retry-After": {strconv.Itoa(int(asked / time.Second))}},
-		})}
+		}))
 
-		status, err := send(t, base, retry.Options{Retries: 1, Backoff: time.Millisecond}, http.MethodGet, nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if want := map[bool]int{true: 2, false: 1}[again]; len(base.attempts()) != want {
-			t.Errorf("with no MaxBackoff named, a Retry-After of %v: %d after %d attempts, want %d attempts",
-				asked, status, len(base.attempts()), want)
+		switch {
+		case !again && len(waited[0]) != 0:
+			t.Errorf("with no MaxBackoff named, a Retry-After of %v was obeyed, with a wait of %v", asked, waited[0])
+		case again && (len(waited[0]) != 1 || waited[0][0] != asked):
+			t.Errorf("with no MaxBackoff named, a Retry-After of %v: waits %v, want that one", asked, waited[0])
 		}
 	}
 }
