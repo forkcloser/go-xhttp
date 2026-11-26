@@ -6,8 +6,17 @@ package xhttp_test
 //     for by name: a request that is not https fails with ErrCleartext unless
 //     Cleartext; a server with no post-quantum hybrid key exchange, or no TLS
 //     1.3, fails the handshake with ErrHandshakeRefused unless the transport
-//     names Classical or Legacy; a level there is none of panics when the
+//     names Classical or Legacy, whether it says so with an alert (RFC 8446,
+//     4.1.1: "the server MUST abort the handshake with a handshake_failure
+//     or an insufficient_security alert") or answers in TLS 1.2 and leaves
+//     this side to end the handshake (appendix D.1: "If the server does not
+//     support TLS 1.3, it will respond with a ServerHello containing an
+//     older version number"); a level there is none of panics when the
 //     transport is made;
+//   - ErrHandshakeRefused is a handshake that failed for another reason than
+//     the server's certificate or the network: not a certificate that is not
+//     trusted, not a connection closed in the middle of the handshake, and
+//     not what a server says once the handshake is done;
 //   - Offline fails every request with ErrOffline, and nothing is dialed;
 //   - a request the posture refuses has its body closed, as RoundTrip must;
 //   - a request whose body the server stops taking for StallTimeout fails
@@ -251,6 +260,195 @@ func TestARefusedHandshakeKeepsItsCause(t *testing.T) {
 
 	if alert, found := errors.AsType[*net.OpError](err); !found || alert.Op != "remote error" {
 		t.Fatalf("the server's alert is not in the chain of %v", err)
+	}
+}
+
+// answeringInTLS12 is the address of a server that answers every ClientHello
+// as a stack from before TLS 1.3 does: it knows nothing of the extension
+// that offers TLS 1.3, reads the TLS 1.2 the hello also carries, and answers
+// with a TLS 1.2 ServerHello. It sends no alert.
+func answeringInTLS12(t *testing.T) string {
+	t.Helper()
+
+	return "https://" + answeringEachConnection(t, func(conn net.Conn) {
+		// The record that carries the ClientHello: five bytes, the last
+		// two its length.
+		header := make([]byte, 5)
+		if _, err := io.ReadFull(conn, header); err != nil {
+			return
+		}
+
+		if _, err := io.CopyN(io.Discard, conn, int64(header[3])<<8|int64(header[4])); err != nil {
+			return
+		}
+
+		hello := []byte{0x03, 0x03} // TLS 1.2
+
+		// The random, which is not the one a TLS 1.3 server signals a
+		// downgrade with.
+		for index := range 32 {
+			hello = append(hello, byte(index+1))
+		}
+
+		hello = append(hello,
+			0x00,       // no session
+			0xc0, 0x2f, // TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256
+			0x00, // no compression
+		)
+
+		handshake := append([]byte{0x02, 0x00, 0x00, byte(len(hello))}, hello...)
+
+		_, _ = conn.Write(append([]byte{0x16, 0x03, 0x03, 0x00, byte(len(handshake))}, handshake...))
+
+		// Whatever the client answers, until it hangs up.
+		_, _ = io.Copy(io.Discard, conn)
+	})
+}
+
+// answeringEachConnection is the address of a listener that hands each
+// connection it accepts to answer, and closes it after.
+func answeringEachConnection(t *testing.T, answer func(net.Conn)) string {
+	t.Helper()
+
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Cleanup(func() { _ = listener.Close() })
+
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+
+			go func() {
+				defer func() { _ = conn.Close() }()
+
+				_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+
+				answer(conn)
+			}()
+		}
+	}()
+
+	return listener.Addr().String()
+}
+
+// TestWhatARefusedHandshakeIs: a handshake that fails is ErrHandshakeRefused
+// by where it failed and for what, and not by how the failure is typed.
+func TestWhatARefusedHandshakeIs(t *testing.T) {
+	t.Parallel()
+
+	plain := httptest.NewServer(http.HandlerFunc(ok))
+	t.Cleanup(plain.Close)
+
+	untrusted := httptest.NewTLSServer(http.HandlerFunc(ok))
+	t.Cleanup(untrusted.Close)
+
+	// With TLS 1.3 a server turns a client down for its certificate once
+	// the client's side of the handshake is done.
+	demanding, demandingRoots := secure(
+		t,
+		ok,
+		func(config *tls.Config) { config.ClientAuth = tls.RequireAnyClientCert },
+	)
+
+	// With the hello unread, which resets the connection, and with it read,
+	// which ends it.
+	resetting := "https://" + answeringEachConnection(t, func(conn net.Conn) {
+		_, _ = conn.Read(make([]byte, 1))
+	})
+	ending := "https://" + answeringEachConnection(t, func(conn net.Conn) {
+		header := make([]byte, 5)
+		if _, err := io.ReadFull(conn, header); err == nil {
+			_, _ = io.CopyN(io.Discard, conn, int64(header[3])<<8|int64(header[4]))
+		}
+	})
+	silent := "https://" + answeringEachConnection(t, func(conn net.Conn) {
+		_, _ = io.Copy(io.Discard, conn)
+	})
+
+	// A record of TLS 1.2 that is cut after three bytes, and one that is
+	// whole and empty, which this side turns down with an alert of its own.
+	answeringWith := func(record ...byte) string {
+		return "https://" + answeringEachConnection(t, func(conn net.Conn) {
+			header := make([]byte, 5)
+			if _, err := io.ReadFull(conn, header); err != nil {
+				return
+			}
+
+			if _, err := io.CopyN(io.Discard, conn, int64(header[3])<<8|int64(header[4])); err != nil {
+				return
+			}
+
+			_, _ = conn.Write(record)
+		})
+	}
+
+	// Shorter than the ten seconds a handshake is given.
+	soon, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
+	defer cancel()
+
+	for name, server := range map[string]struct {
+		ctx     context.Context //nolint:containedctx // one case of the table has a deadline
+		address string
+		config  xhttp.Config
+		refused bool
+	}{
+		"a server that answers in TLS 1.2, at HybridOnly": {
+			t.Context(), answeringInTLS12(t), xhttp.Config{}, true,
+		},
+		"a server that answers in TLS 1.2, at Classical": {
+			t.Context(), answeringInTLS12(t), xhttp.Config{KeyExchange: xhttp.Classical}, true,
+		},
+		"a server that does not speak TLS": {
+			t.Context(), "https://" + strings.TrimPrefix(plain.URL, "http://"), xhttp.Config{}, true,
+		},
+		"a server whose answer is a handshake record with nothing in it": {
+			t.Context(), answeringWith(0x16, 0x03, 0x03, 0x00, 0x00), xhttp.Config{}, true,
+		},
+		"a server that ends the connection in the middle of its answer": {
+			t.Context(), answeringWith(0x16, 0x03, 0x03), xhttp.Config{}, false,
+		},
+		"a server that resets the connection on the ClientHello": {t.Context(), resetting, xhttp.Config{}, false},
+		"a server that ends the connection on the ClientHello":   {t.Context(), ending, xhttp.Config{}, false},
+		"a context that ends in the middle of the handshake":     {soon, silent, xhttp.Config{}, false},
+		"a certificate that is not trusted":                      {t.Context(), untrusted.URL, xhttp.Config{}, false},
+		"a server that wants a client certificate, in TLS 1.3": {
+			t.Context(), demanding.URL, xhttp.Config{Roots: demandingRoots}, false,
+		},
+	} {
+		_, err := get(server.ctx, t, xhttp.NewClient(server.config), server.address)
+		if err == nil || errors.Is(err, xhttp.ErrHandshakeRefused) != server.refused {
+			t.Errorf("%s: %v; ErrHandshakeRefused: %t, want %t", name, err, !server.refused, server.refused)
+		}
+	}
+}
+
+// TestAHandshakeTheServerNeverAnswers: the ten seconds a handshake is given
+// end it with net/http's own error, a timeout, which is the network's and
+// no refusal. It takes those ten seconds.
+func TestAHandshakeTheServerNeverAnswers(t *testing.T) {
+	t.Parallel()
+
+	silent := "https://" + answeringEachConnection(t, func(conn net.Conn) {
+		_, _ = io.Copy(io.Discard, conn)
+	})
+
+	started := time.Now()
+
+	_, err := get(t.Context(), t, xhttp.NewClient(xhttp.Config{}), silent)
+
+	timed, found := errors.AsType[net.Error](err)
+	if !found || !timed.Timeout() || errors.Is(err, xhttp.ErrHandshakeRefused) {
+		t.Errorf("%v, want a timeout that is no ErrHandshakeRefused", err)
+	}
+
+	if waited := time.Since(started); waited < 10*time.Second || waited > 25*time.Second {
+		t.Errorf("the handshake was given %v, want ten seconds", waited)
 	}
 }
 
@@ -596,38 +794,6 @@ func TestARequestTheServerStopsTaking(t *testing.T) {
 			t.Errorf("a body that takes its time, to a server that reads it: %d, %v; want 200", status, err)
 		}
 	})
-}
-
-// answeringEachConnection is the address of a listener that hands each
-// connection it accepts to answer, and closes it after.
-func answeringEachConnection(t *testing.T, answer func(net.Conn)) string {
-	t.Helper()
-
-	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	t.Cleanup(func() { _ = listener.Close() })
-
-	go func() {
-		for {
-			conn, err := listener.Accept()
-			if err != nil {
-				return
-			}
-
-			go func() {
-				defer func() { _ = conn.Close() }()
-
-				_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
-
-				answer(conn)
-			}()
-		}
-	}()
-
-	return listener.Addr().String()
 }
 
 // TestTheBodyNetHTTPTakesAgainIsReadThroughTheWaitToo: when a connection of

@@ -28,9 +28,10 @@ client.Transport = retry.NewTransport(client.Transport, retry.Options{Retries: 3
 | Offline | off | `Config.Offline` |
 
 A transport has one key exchange level, for every connection it makes: a
-program that reaches hosts at two levels makes two transports. A server that
-ends the TLS handshake with an alert is `ErrHandshakeRefused`, the one
-sentinel to test before naming a weaker level for that server.
+program that reaches hosts at two levels makes two transports. A TLS
+handshake that fails for another reason than the server's certificate or the
+network is `ErrHandshakeRefused`, the one sentinel to test before naming a
+weaker level for that server.
 
 ## Retries
 

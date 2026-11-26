@@ -37,9 +37,10 @@
 //   - [ErrOffline]: the transport was told to be offline. Nothing was dialed.
 //   - [ErrCleartext]: the request is not https. Fix the URL, or make the
 //     transport with Config.Cleartext.
-//   - [ErrHandshakeRefused]: the server answered with a TLS alert. No retry
-//     changes that; a weaker [KeyExchange] may, when the alert is for what
-//     the transport offered and not for the client's certificate.
+//   - [ErrHandshakeRefused]: the TLS handshake failed, and neither the
+//     server's certificate nor the network is the cause. Most often the
+//     server has nothing the transport's level accepts, which no retry
+//     changes and a weaker [KeyExchange] may.
 //   - [ErrStalled]: the server went silent, in the middle of the request,
 //     before its response, or in the middle of its body. What was read of a
 //     body is the caller's, and so is asking for the rest.

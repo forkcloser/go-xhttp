@@ -8,12 +8,14 @@ var (
 	// ErrCleartext is the error of a request that is not https, through a
 	// transport that was not told to send one.
 	ErrCleartext = errors.New("not https")
-	// ErrHandshakeRefused is the error of a TLS alert from the server: most
+	// ErrHandshakeRefused is the error of a TLS handshake that failed, when
+	// neither the server's certificate nor the network is the cause: most
 	// often a server that offers no key exchange, or no TLS version, the
-	// transport's level accepts. A server that turns down the client's
-	// certificate says so with an alert too, and with TLS 1.3 after the
-	// client's side of the handshake is done.
-	ErrHandshakeRefused = errors.New("the server refused the TLS handshake")
+	// transport's level accepts, whichever side ends the handshake over it.
+	// A failure of the server's own in the middle of a handshake is in it
+	// too, and may pass at another attempt: nothing tells the two apart.
+	// What a server says once the handshake is done is not in it.
+	ErrHandshakeRefused = errors.New("the TLS handshake failed")
 	// ErrStalled is the error of a server that stayed silent for longer than
 	// [Config.StallTimeout]: it stopped taking the request, its response did
 	// not begin once the request was sent, or the response's body stopped

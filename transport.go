@@ -123,8 +123,11 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 	// is what unblocks a transport waiting on a connection gone quiet.
 	ctx, cancel := context.WithCancelCause(req.Context())
 
-	awaited := await(cancel, t.stall)
-	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{WroteRequest: awaited.sent})
+	awaited, shaken := await(cancel, t.stall), &handshakes{}
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{
+		TLSHandshakeDone: shaken.done,
+		WroteRequest:     awaited.sent,
+	})
 
 	resp, err := t.base.RoundTrip(t.outgoing(ctx, req, awaited))
 
@@ -140,7 +143,7 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 			return nil, awaited.stalled()
 		}
 
-		return nil, refused(err)
+		return nil, shaken.refused(err)
 	}
 
 	// The copy's context ends with the body: the caller's own request is the
@@ -206,14 +209,64 @@ func closeBody(req *http.Request) {
 	}
 }
 
-// refused marks a TLS alert from the server, which reaches here as a
-// net.OpError of this operation: the alert type behind it is not exported.
-func refused(err error) error {
-	if opErr, ok := errors.AsType[*net.OpError](err); ok && opErr.Op == "remote error" {
+// handshakes keeps what the last TLS handshake made for one request ended
+// in: its error, or nil.
+type handshakes struct {
+	mu   sync.Mutex
+	last error
+}
+
+// done is httptrace's TLSHandshakeDone.
+func (h *handshakes) done(_ tls.ConnectionState, err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.last = err
+}
+
+// refused marks err when it is the failure of a handshake made for the
+// request, and neither the server's certificate nor the network is its
+// cause. A failure is told by where it happened and not by its type: of two
+// servers with no TLS 1.3, one says so with an alert, and the other answers
+// in TLS 1.2 and it is this side that ends the handshake, with an error that
+// has no type.
+func (h *handshakes) refused(err error) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	// The handshake's error itself, in err's chain: a connection net/http
+	// makes for a request may fail while the request travels on another,
+	// and ends in an error that is not the handshake's. No error has the
+	// nil of a handshake that worked in its chain.
+	if errors.Is(err, h.last) && !untrusted(h.last) && !ofTheNetwork(h.last) {
 		return fmt.Errorf("%w: %w", ErrHandshakeRefused, err)
 	}
 
 	return err
+}
+
+func untrusted(err error) bool {
+	_, found := errors.AsType[*tls.CertificateVerificationError](err)
+
+	return found
+}
+
+// ofTheNetwork reports a handshake that the connection ended, or time did,
+// and neither side's TLS: a connection closed or reset, a timeout.
+func ofTheNetwork(err error) bool {
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+
+	if timed, found := errors.AsType[net.Error](err); found && timed.Timeout() {
+		return true
+	}
+
+	// crypto/tls gives an alert, received or sent, as an OpError of its own
+	// two operations; every other one is the connection's.
+	failed, found := errors.AsType[*net.OpError](err)
+
+	return found && failed.Op != "remote error" && failed.Op != "local error"
 }
 
 // awaiting fails a request the server leaves waiting for longer than limit:
