@@ -76,12 +76,14 @@ type transport struct {
 
 // RoundTrip implements http.RoundTripper.
 func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
-	resp, err := t.base.RoundTrip(req)
-
-	// A request with no URL or no header map is the base's to refuse, once.
+	// Asked before the request is the base's: once it is, a read of its
+	// body may be writing the Trailer this looks at. A request with no URL
+	// or no header map is the base's to refuse, once.
 	if req.URL == nil || req.Header == nil || !rewindable(req) {
-		return resp, err //nolint:wrapcheck // the base's own error, unchanged
+		return t.base.RoundTrip(req) //nolint:wrapcheck // the base's own error, unchanged
 	}
+
+	resp, err := t.base.RoundTrip(req)
 
 	for retry := 1; retry <= t.retries; retry++ {
 		wait, again := t.wait(req, resp, err, retry)
@@ -257,15 +259,18 @@ func (*transport) log(req *http.Request, status int, err error, retry int, wait 
 	)
 }
 
-// rewindable reports a request whose body can be sent a second time: it has
-// none, or it has a GetBody.
+// rewindable reports a request that can be sent a second time: its body is
+// none, or has a GetBody, and it has no Trailer. A caller fills the Trailer
+// while the body is read, and the transport under this one may go on reading
+// the body, and then the map, after its RoundTrip has returned: two attempts
+// would have the one map between them. A Trailer that declares nothing
+// counts: net/http sends what the map holds when the body ends.
 func rewindable(req *http.Request) bool {
-	return req.Body == nil || req.Body == http.NoBody || req.GetBody != nil
+	return req.Trailer == nil && (req.Body == nil || req.Body == http.NoBody || req.GetBody != nil)
 }
 
 // rewound is a copy of req to send again, with its body from the start. A
-// RoundTripper leaves the caller's request as it is; not Request.Clone, which
-// copies Trailer, which a caller fills while the body is read.
+// RoundTripper leaves the caller's request as it is.
 func rewound(req *http.Request) (*http.Request, error) {
 	sent := req.WithContext(req.Context())
 

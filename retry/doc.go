@@ -15,7 +15,10 @@
 //
 // A request with a body is sent again only if it has a GetBody, which
 // http.NewRequest sets for a body in memory. One whose body is a stream is
-// sent once.
+// sent once. So is one that has a Trailer, whatever it declares: a caller
+// sets trailers while the body is read, an http.RoundTripper may still be
+// reading both after it has answered, and two attempts would have the one
+// Trailer between them.
 //
 // The same section of RFC 9110 ends: "A client SHOULD NOT automatically retry
 // a failed automatic retry." With [Options.Retries] above one this package

@@ -34,9 +34,13 @@ package retry_test
 //     what it asks to a quarter more, or to MaxBackoff. It asks as a delay,
 //     which is digits and nothing else (delay-seconds = 1*DIGIT), or as a
 //     date; a value that is neither asks for nothing;
+//   - a request that has a Trailer is sent once, and nothing of the Trailer
+//     is read once the request is with the transport under this one: it is
+//     filled as the body is read (net/http, Request.Trailer: "the map values can be
+//     updated while the request body is read"), and a RoundTripper may read
+//     the body, and close it, "in a separate goroutine even after RoundTrip
+//     returns", so that two attempts would use the one map at once;
 //   - the caller's request is left as it was, and is the response's Request;
-//     a trailer the caller sets while the body is read is sent with each
-//     attempt;
 //   - a retry is a debug record with the method, the host and the cause,
 //     the status or the error, and no path and no query, those of a
 //     *url.Error included (net/url: "Error reports an error and the
@@ -1118,11 +1122,10 @@ func (b *trailing) Read(into []byte) (int, error) {
 
 func (*trailing) Close() error { return nil }
 
-// TestATrailerIsSentWithEachAttempt: a retry goes out on a copy of the
-// request, and the copy must share the caller's trailers: the one set while
-// an attempt's body is read is the one that attempt sends, not what the map
-// held when the copy was made.
-func TestATrailerIsSentWithEachAttempt(t *testing.T) {
+// TestARequestWithTrailersIsSentOnce: a request that declares trailers gets
+// one attempt, whose answer comes back, and its trailer arrives as its body
+// set it.
+func TestARequestWithTrailersIsSentOnce(t *testing.T) {
 	t.Parallel()
 
 	var (
@@ -1138,9 +1141,7 @@ func TestATrailerIsSentWithEachAttempt(t *testing.T) {
 
 		arrived = append(arrived, r.Trailer.Get("X-Checksum"))
 
-		if len(arrived) < 3 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-		}
+		w.WriteHeader(http.StatusServiceUnavailable)
 	}))
 	t.Cleanup(server.Close)
 
@@ -1149,8 +1150,7 @@ func TestATrailerIsSentWithEachAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// One map for the life of the request, declared before it is sent as
-	// net/http asks.
+	// Declared before the request is sent, as net/http asks.
 	req.Trailer = http.Header{"X-Checksum": nil}
 
 	readings := 0
@@ -1174,13 +1174,137 @@ func TestATrailerIsSentWithEachAttempt(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 
-	if resp.StatusCode != http.StatusOK || len(arrived) != 3 {
-		t.Fatalf("status %d after %d attempts; want 200 after 3", resp.StatusCode, len(arrived))
+	if resp.StatusCode != http.StatusServiceUnavailable || len(arrived) != 1 || readings != 1 {
+		t.Fatalf("status %d after %d attempts and %d bodies; want the 503 after 1 and 1",
+			resp.StatusCode, len(arrived), readings)
 	}
 
-	for attempt, got := range arrived {
-		if want := "of reading " + strconv.Itoa(attempt+1); got != want {
-			t.Errorf("attempt %d: the server saw the trailer %q, want %q", attempt+1, got, want)
+	if arrived[0] != "of reading 1" {
+		t.Errorf("the server saw the trailer %q, want the one the body set", arrived[0])
+	}
+}
+
+// eager is a request body that is read a few bytes at a time and sets a
+// trailer of its request at each read, as a caller that sends a running
+// checksum does.
+type eager struct {
+	req  *http.Request
+	left int
+}
+
+func (b *eager) Read(into []byte) (int, error) {
+	b.req.Trailer.Set("X-Checksum", "so far")
+
+	if b.left == 0 {
+		return 0, io.EOF
+	}
+
+	time.Sleep(time.Millisecond)
+
+	read := min(len(into), b.left, 16)
+	for index := range read {
+		into[index] = 'x'
+	}
+
+	b.left -= read
+
+	return read, nil
+}
+
+func (*eager) Close() error { return nil }
+
+// TestTheTrailerIsNotReadOnceTheRequestIsSent: a server that answers before
+// it has read the request leaves net/http's transport reading the body, and
+// the body writing the Trailer, after RoundTrip has returned. Nothing here
+// reads the Trailer then: the request gets its one attempt, and the race
+// detector finds nothing.
+func TestTheTrailerIsNotReadOnceTheRequestIsSent(t *testing.T) {
+	t.Parallel()
+
+	var requests atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+
+		// Before any of the body is read: the client is still sending it.
+		control := http.NewResponseController(w)
+		_ = control.EnableFullDuplex()
+
+		w.WriteHeader(http.StatusServiceUnavailable)
+
+		_ = control.Flush()
+	}))
+	t.Cleanup(server.Close)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, server.URL, http.NoBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	req.Trailer = http.Header{"X-Checksum": nil}
+
+	// 64 reads of a millisecond each: far longer than the answer takes.
+	body := func() (io.ReadCloser, error) { return &eager{req: req, left: 1024}, nil }
+
+	req.Body, _ = body()
+	req.GetBody = body
+	req.ContentLength = -1
+
+	standard := &http.Transport{}
+	t.Cleanup(standard.CloseIdleConnections)
+
+	resp, err := retry.NewTransport(standard, quick(3)).RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_ = resp.Body.Close()
+
+	if resp.StatusCode != http.StatusServiceUnavailable || requests.Load() != 1 {
+		t.Errorf("status %d after %d requests; want the 503 after 1", resp.StatusCode, requests.Load())
+	}
+}
+
+// TestWhatMakesARequestOneThatIsSentOnce: of a PUT that is answered 503,
+// what its body and its trailers make of it.
+func TestWhatMakesARequestOneThatIsSentOnce(t *testing.T) {
+	t.Parallel()
+
+	for name, made := range map[string]struct {
+		edit     func(*http.Request)
+		attempts int
+	}{
+		"a body in memory":                {func(*http.Request) {}, 2},
+		"no body":                         {func(req *http.Request) { req.Body, req.GetBody = nil, nil }, 2},
+		"http.NoBody":                     {func(req *http.Request) { req.Body, req.GetBody = http.NoBody, nil }, 2},
+		"a stream":                        {func(req *http.Request) { req.GetBody = nil }, 1},
+		"trailers":                        {func(req *http.Request) { req.Trailer = http.Header{"X-Checksum": nil} }, 1},
+		"trailers and no body":            {func(req *http.Request) { req.Body, req.Trailer = nil, http.Header{"X-Checksum": nil} }, 1},
+		"a Trailer that declares nothing": {func(req *http.Request) { req.Trailer = http.Header{} }, 1},
+	} {
+		req, err := http.NewRequestWithContext(
+			t.Context(),
+			http.MethodPut,
+			"https://server.test/",
+			strings.NewReader("content"),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		made.edit(req)
+
+		base := &scripted{script: failing(1, answer{status: http.StatusServiceUnavailable})}
+
+		resp, err := retry.NewTransport(base, quick(1)).RoundTrip(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		_ = resp.Body.Close()
+
+		if len(base.attempts()) != made.attempts {
+			t.Errorf("%s: %d attempts, want %d", name, len(base.attempts()), made.attempts)
 		}
 	}
 }
