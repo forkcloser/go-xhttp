@@ -16,6 +16,10 @@ var (
 	// it.
 	// A failure of the server's own in the middle of a handshake is in it
 	// too, and may pass at another attempt: nothing tells the two apart.
+	// Nor does it say whose doing it was: nothing that ends a handshake is
+	// authenticated, and whoever is on the path can end one. Under a [Pin],
+	// a server that presents the pinned certificate and cannot prove it
+	// holds its key ends in it too, and not in [ErrPinMismatch].
 	// What a server says once the handshake is done is not in it.
 	ErrHandshakeRefused = errors.New("the TLS handshake failed")
 	// ErrStalled is the error of a server that stayed silent for longer than
@@ -30,4 +34,15 @@ var (
 	// ErrCredential is the error of [NewCredential] for what would not
 	// arrive as it is, or could never match a request.
 	ErrCredential = errors.New("not a credential")
+	// ErrPin is the error of [NewPin] for what is no host, or no SHA-256
+	// fingerprint.
+	ErrPin = errors.New("not a pin")
+	// ErrPinMismatch is the error of a transport that has a [Pin] when what
+	// it meets is not the pinned server: a request for another host, which
+	// is not sent, or a server that presents another certificate, with
+	// which the TLS handshake is not completed. It is the pin's own refusal
+	// and no more: the pinned certificate in the hands of a server that
+	// does not hold its key matches the pin, and fails the handshake as
+	// [ErrHandshakeRefused].
+	ErrPinMismatch = errors.New("not the pinned server")
 )

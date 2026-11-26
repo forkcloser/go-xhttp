@@ -213,7 +213,7 @@ func TestAnErrorThatIsNotThePackagesIsNetHTTPs(t *testing.T) {
 
 			for _, sentinel := range []error{
 				xhttp.ErrOffline, xhttp.ErrCleartext, xhttp.ErrHandshakeRefused, xhttp.ErrStalled, xhttp.ErrRedirect,
-				xhttp.ErrCredential,
+				xhttp.ErrCredential, xhttp.ErrPin, xhttp.ErrPinMismatch,
 			} {
 				if errors.Is(err, sentinel) {
 					t.Errorf("%s: %v is the package's %v", name, err, sentinel)

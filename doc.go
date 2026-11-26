@@ -31,6 +31,11 @@
 //     and sees the host and port it is asked to connect to and no more of
 //     an https request.
 //
+// A transport given a [Pin] is one server's instead: it trusts that server by
+// the fingerprint of its certificate, whoever signed it, consults no root,
+// takes no proxy, and sends no request to another host. That is for a server
+// no authority vouches for, a device with a certificate of its own making.
+//
 // A transport carries no request that a redirect leads to from https to
 // anything else, whatever client follows the redirect, and a client from
 // [NewClient] follows at most ten: both are [ErrRedirect]. [Authorize] adds a
@@ -39,7 +44,7 @@
 //
 // # Errors
 //
-// A fault the package itself raises wraps one of six sentinels, each named
+// A fault the package itself raises wraps one of eight sentinels, each named
 // for what a caller does on it:
 //
 //   - [ErrOffline]: the transport was told to be offline. Nothing was dialed.
@@ -49,7 +54,10 @@
 //   - [ErrHandshakeRefused]: the TLS handshake failed, and neither the
 //     server's certificate nor the network is the cause. Most often the
 //     server has nothing the transport's level accepts, which no retry
-//     changes and a weaker [TLSLevel] may.
+//     changes and a weaker [TLSLevel] may. It is no word on who answered:
+//     whoever is on the path can end a handshake, and under a [Pin] this is
+//     also how a server ends that presents the pinned certificate and does
+//     not hold its key.
 //   - [ErrStalled]: the server went silent, in the middle of the request,
 //     before its response, or in the middle of its body. What was read of a
 //     body is the caller's, and so is asking for the rest.
@@ -57,6 +65,15 @@
 //     another scheme, or it was one too many.
 //   - [ErrCredential]: [NewCredential] was given what would not arrive as
 //     it is, or could never match. Fix the argument the error names.
+//   - [ErrPin]: [NewPin] was given what is no host, or no SHA-256
+//     fingerprint. Fix the argument the error names.
+//   - [ErrPinMismatch]: what a pinned transport met is not the pinned
+//     server. Either the request is for another host, and was not sent, or
+//     the server presents another certificate than the pinned one: it was
+//     replaced, or something stands between. The error has the fingerprint
+//     that was presented; nothing was sent over that connection. That
+//     something stands between is not always this error: see
+//     [ErrHandshakeRefused].
 //
 // Every other error is the standard library's and passes through unchanged.
 //

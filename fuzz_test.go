@@ -1,8 +1,11 @@
 package xhttp_test
 
 import (
+	"encoding/hex"
 	"errors"
 	"net/url"
+	"regexp"
+	"strings"
 	"testing"
 
 	"github.com/forkcloser/xhttp"
@@ -73,6 +76,41 @@ func FuzzCredentialHost(f *testing.F) {
 				got,
 				want,
 			)
+		}
+	})
+}
+
+// FuzzPinFingerprint: whatever is written for a fingerprint, NewPin takes it
+// exactly when it is one of the two forms, and the pin is then of the bytes
+// those digits spell. The truth is a regular expression and encoding/hex.
+func FuzzPinFingerprint(f *testing.F) {
+	const fingerprint = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+	for _, seed := range []string{
+		fingerprint, strings.ToUpper(fingerprint), asOpenSSLPrints(fingerprint), "", fingerprint[1:], fingerprint + "0",
+		strings.Repeat("0", 95), strings.Repeat(":", 95), "sha256:" + fingerprint, fingerprint + "\n",
+		strings.ReplaceAll(asOpenSSLPrints(fingerprint), ":", "-"), asOpenSSLPrints(fingerprint) + ":",
+	} {
+		f.Add(seed)
+	}
+
+	forms := regexp.MustCompile(`^([0-9a-fA-F]{64}|([0-9a-fA-F]{2}:){31}[0-9a-fA-F]{2})$`)
+
+	f.Fuzz(func(t *testing.T, written string) {
+		pin, err := xhttp.NewPin("device.test", written)
+
+		if !forms.MatchString(written) {
+			if !errors.Is(err, xhttp.ErrPin) {
+				t.Fatalf("%q is no fingerprint, and NewPin gave %v, %v", written, pin, err)
+			}
+
+			return
+		}
+
+		spelled, _ := hex.DecodeString(strings.ReplaceAll(written, ":", ""))
+
+		if want := "device.test:443 pinned to " + hex.EncodeToString(spelled); err != nil || pin.String() != want {
+			t.Fatalf("%q is a fingerprint, and NewPin gave %v, %v; want %s", written, pin, err, want)
 		}
 	})
 }
