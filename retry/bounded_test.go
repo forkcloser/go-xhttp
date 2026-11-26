@@ -1,9 +1,3 @@
-// Copyright Mycophonic.
-// Copyright Forkcloser.
-//
-// Use of this source code is governed by the MIT license that can be
-// found in the LICENSE file.
-
 package retry_test
 
 // The walk within the bound: every method of RFC 9110 and one outside it,

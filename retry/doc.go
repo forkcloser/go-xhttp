@@ -1,9 +1,3 @@
-// Copyright Mycophonic.
-// Copyright Forkcloser.
-//
-// Use of this source code is governed by the MIT license that can be
-// found in the LICENSE file.
-
 // Package retry sends a request again when that is safe and may help.
 // [NewTransport] wraps any http.RoundTripper, one from xhttp or not:
 //

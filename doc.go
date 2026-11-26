@@ -1,9 +1,3 @@
-// Copyright Mycophonic.
-// Copyright Forkcloser.
-//
-// Use of this source code is governed by the MIT license that can be
-// found in the LICENSE file.
-
 // Package xhttp is the client side of net/http under a posture. [NewTransport]
 // and [NewClient] return the standard library's own types, built from a
 // [Config] whose zero value is the strictest setting: whatever is weaker is
