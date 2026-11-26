@@ -8,7 +8,10 @@ package xhttp_test
 import (
 	"context"
 	"crypto/tls"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"net/netip"
@@ -660,6 +663,88 @@ func TestTheFirstCredentialForAHostDecides(t *testing.T) {
 			"Authorization %q, want none: the first credential for the host does not name where the redirect came from",
 			got,
 		)
+	}
+}
+
+// holder keeps a credential where fmt cannot ask it how it prints.
+type holder struct {
+	held xhttp.Credential
+	many []xhttp.Credential
+	at   *xhttp.Credential
+}
+
+// TestACredentialNeverPrintsItsToken: under every verb fmt has, alone, by
+// pointer, in a slice and inside a struct whose fields fmt reads without
+// asking them, through log/slog's two handlers and through encoding/json, a
+// credential is its scheme and its hosts.
+func TestACredentialNeverPrintsItsToken(t *testing.T) {
+	t.Parallel()
+
+	const secret = "s3cr3t-token"
+
+	held := credential(t, "Bearer", secret, "registry.test", "[::1]:8443")
+
+	var written strings.Builder
+
+	for _, verb := range "vsqdxXobcUeEfFgGtTp" {
+		for _, flag := range []string{"", "+", "#", " ", "0", "-", "8", ".3"} {
+			format := "%" + flag + string(verb) + "\n"
+
+			for _, value := range []any{
+				held, &held,
+				[]xhttp.Credential{held},
+				map[string]xhttp.Credential{"key": held},
+				holder{held: held, many: []xhttp.Credential{held}, at: &held},
+				&holder{held: held},
+			} {
+				fmt.Fprintf(&written, format, value)
+			}
+		}
+	}
+
+	fmt.Fprintln(&written, held, &held, holder{held: held})
+
+	for _, handler := range []slog.Handler{
+		slog.NewTextHandler(&written, nil),
+		slog.NewJSONHandler(&written, nil),
+	} {
+		slog.New(handler).Info("a credential", "held", held, "at", &held, "inside", holder{held: held})
+	}
+
+	encoded, err := json.Marshal(map[string]any{"held": held, "at": &held, "many": []xhttp.Credential{held}})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	written.Write(encoded)
+
+	text := written.String()
+
+	if strings.Contains(text, secret) {
+		t.Errorf(
+			"the token was printed:\n%s",
+			text[max(0, strings.Index(text, secret)-200):strings.Index(text, secret)+len(secret)],
+		)
+	}
+
+	const shown = "Bearer credential for registry.test:443, [::1]:8443"
+
+	if got := fmt.Sprintf(
+		"%v|%+v|%#v|%s|%d",
+		held,
+		held,
+		&held,
+		held,
+		held,
+	); got != strings.Repeat(
+		shown+"|",
+		4,
+	)+shown {
+		t.Errorf("a credential prints as %q, want %q under each verb", got, shown)
+	}
+
+	if got := fmt.Sprint(xhttp.Credential{}); got != "credential for no host" {
+		t.Errorf("the zero Credential prints as %q", got)
 	}
 }
 

@@ -37,6 +37,10 @@ package xhttp_test
 //     the credential only when every request that led to it was https and
 //     for a host the credential names; when that withholds the first
 //     credential for a host, no other is sent;
+//   - a Credential prints as its scheme and its hosts and never as its
+//     token: under every verb of fmt, where fmt asks the value (fmt:
+//     Formatter) and where it reads the fields itself (a value in an
+//     unexported field), and so through log/slog and encoding/json;
 //   - Redirects follows at most its limit, and none from https to anything
 //     else: both are ErrRedirect;
 //   - an error that is not the posture's is the standard library's, unchanged.

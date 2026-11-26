@@ -3,6 +3,8 @@ package xhttp
 import (
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/http"
 	"net/netip"
 	"net/url"
@@ -17,9 +19,16 @@ import (
 // client makes on a redirect, unless every request that led there was https
 // and for a host it names: another host would be choosing what the token is
 // presented for. The zero Credential names no host and is never sent.
+//
+// A Credential prints as its scheme and its hosts, whatever the verb, and
+// never as its token.
 type Credential struct {
-	// header is the Authorization field's value, scheme and token.
-	header string
+	scheme string
+	// header is the Authorization field's value, scheme and token. Behind
+	// a pointer: fmt prints the fields of a value it cannot ask, one held
+	// in an unexported field of a caller's struct, and prints a pointer
+	// there as an address.
+	header *string
 	hosts  []host
 }
 
@@ -29,6 +38,15 @@ type host struct {
 	name string
 	addr netip.Addr
 	port uint16
+}
+
+func (h host) String() string {
+	name := h.name
+	if h.addr.IsValid() {
+		name = h.addr.String()
+	}
+
+	return net.JoinHostPort(name, strconv.FormatUint(uint64(h.port), 10))
 }
 
 var (
@@ -76,7 +94,8 @@ func NewCredential(scheme, token string, hosts ...string) (Credential, error) {
 		return Credential{}, fmt.Errorf("%w: no host is named", ErrCredential)
 	}
 
-	made := Credential{header: scheme + " " + token, hosts: make([]host, 0, len(hosts))}
+	header := scheme + " " + token
+	made := Credential{scheme: scheme, header: &header, hosts: make([]host, 0, len(hosts))}
 
 	for _, written := range hosts {
 		parsed, err := parseHost(written)
@@ -88,6 +107,22 @@ func NewCredential(scheme, token string, hosts ...string) (Credential, error) {
 	}
 
 	return made, nil
+}
+
+// Format implements fmt.Formatter.
+func (c Credential) Format(state fmt.State, _ rune) {
+	if len(c.hosts) == 0 {
+		_, _ = io.WriteString(state, "credential for no host")
+
+		return
+	}
+
+	names := make([]string, len(c.hosts))
+	for at, named := range c.hosts {
+		names[at] = named.String()
+	}
+
+	_, _ = fmt.Fprintf(state, "%s credential for %s", c.scheme, strings.Join(names, ", "))
 }
 
 // fieldValue reports whether text, after a scheme and a space, is sent in a
@@ -147,7 +182,7 @@ func (a *authorizer) RoundTrip(req *http.Request) (*http.Response, error) {
 	// it copies Trailer, which a caller fills while the body is read.
 	sent := req.WithContext(req.Context())
 	sent.Header = req.Header.Clone()
-	sent.Header.Set("Authorization", credential.header)
+	sent.Header.Set("Authorization", *credential.header)
 
 	resp, err := a.base.RoundTrip(sent)
 	if err != nil || resp == nil {
