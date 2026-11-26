@@ -381,7 +381,7 @@ func TestStalledBody(t *testing.T) {
 }
 
 // TestTheZeroConfigWatchesForAStall: the protection is on when nothing is
-// said, at DefaultStallTimeout. It takes that long, a minute, to see.
+// said, at the minute the docs give. It takes that long to see.
 func TestTheZeroConfigWatchesForAStall(t *testing.T) {
 	t.Parallel()
 
@@ -406,9 +406,10 @@ func TestTheZeroConfigWatchesForAStall(t *testing.T) {
 	}
 
 	// A timer never fires early; the first bytes may have come a moment
-	// before the clock here started.
-	if waited := time.Since(started); waited < xhttp.DefaultStallTimeout-time.Second {
-		t.Errorf("the read failed after %v, want %v", waited, xhttp.DefaultStallTimeout)
+	// before the clock here started. It may fire late, by what a loaded
+	// machine adds, and no later.
+	if waited := time.Since(started); waited < time.Minute-time.Second || waited > time.Minute+15*time.Second {
+		t.Errorf("the read failed after %v, want a minute", waited)
 	}
 }
 

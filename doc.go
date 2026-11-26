@@ -22,7 +22,7 @@
 //   - trusts the system's roots and takes its proxy from the environment,
 //     unless [Config.Roots] or [Config.Proxy] say otherwise.
 //
-// A client from [NewClient] also follows at most [DefaultRedirects] redirects,
+// A client from [NewClient] also follows at most ten redirects,
 // and none from https to anything else ([Redirects]). [Authorize] adds a
 // token to the requests for the hosts the token names, over https, and to no
 // other request.

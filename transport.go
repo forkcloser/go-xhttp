@@ -17,6 +17,7 @@ const https = "https"
 
 // The timeouts and the pool of every transport.
 const (
+	stallTimeout          = time.Minute // of a Config that names none
 	dialTimeout           = 30 * time.Second
 	dialKeepAlive         = 30 * time.Second
 	tlsHandshakeTimeout   = 10 * time.Second
@@ -52,7 +53,7 @@ func NewTransport(config Config) http.RoundTripper {
 
 	stall := config.StallTimeout
 	if stall == 0 {
-		stall = DefaultStallTimeout
+		stall = stallTimeout
 	}
 
 	return &transport{
