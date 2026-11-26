@@ -168,6 +168,12 @@ func (t *transport) wait(req *http.Request, resp *http.Response, err error, retr
 		}
 	}
 
+	// What was asked, and up to a quarter more: the clients a server sent
+	// away together would otherwise come back together.
+	const most = 1.25
+
+	asked = t.between(float64(asked), most*float64(asked))
+
 	wait := max(asked, t.backoffBefore(retry))
 
 	// A wait the context's deadline would cut is not begun: the answer in
@@ -195,17 +201,26 @@ func (t *transport) backoffBefore(retry int) time.Duration {
 		wait *= 2
 	}
 
-	const least, spread = 0.75, 0.5
+	const least, most = 0.75, 1.25
 
-	jittered := float64(wait) * (least + spread*rand.Float64()) // #nosec G404 -- a jitter, not a secret
+	return t.between(least*float64(wait), most*float64(wait))
+}
+
+// between is a wait drawn evenly from low to high, or to MaxBackoff when that
+// is less. The bound comes before the draw: a draw cut at MaxBackoff
+// afterwards leaves every wait that was past it exactly on it.
+func (t *transport) between(low, high float64) time.Duration {
+	high = min(high, float64(t.maxBackoff))
+
+	drawn := low + (high-low)*rand.Float64() // #nosec G404 -- a jitter, not a secret
 
 	// Compared before it is converted: past the largest duration the
 	// conversion is not defined.
-	if jittered >= float64(t.maxBackoff) {
+	if drawn >= float64(t.maxBackoff) {
 		return t.maxBackoff
 	}
 
-	return time.Duration(jittered)
+	return time.Duration(drawn)
 }
 
 func (*transport) log(req *http.Request, status int, err error, retry int, wait time.Duration) {

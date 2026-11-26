@@ -173,22 +173,10 @@ func drawn(t *testing.T, what string, waits []time.Duration, least, most time.Du
 	}
 }
 
-// capped holds every wait to at least least and at most most, which some
-// reach, as some come within a tenth of least.
-func capped(t *testing.T, what string, waits []time.Duration, least, most time.Duration) {
-	t.Helper()
-
-	lowest, highest := slices.Min(waits), slices.Max(waits)
-
-	if lowest < least || lowest > least+(most-least)/10 || highest != most {
-		t.Errorf("%s: the waits go from %v to %v, want from %v to %v", what, lowest, highest, least, most)
-	}
-}
-
-// TestRetryAfter: what a Retry-After asks for is waited, to the nanosecond,
-// when it is longer than the backoff and no longer than MaxBackoff; past
-// MaxBackoff the response comes back; what is no number of seconds and no
-// date asks for nothing, and the wait is the backoff's.
+// TestRetryAfter: what a Retry-After asks for is waited, and a quarter more
+// at most, when it is longer than the backoff and no longer than MaxBackoff;
+// past MaxBackoff the response comes back; what is no number of seconds and
+// no date asks for nothing, and the wait is the backoff's.
 func TestRetryAfter(t *testing.T) {
 	t.Parallel()
 
@@ -276,15 +264,68 @@ func TestRetryAfter(t *testing.T) {
 			switch waited := sent[1].at.Sub(sent[0].at); {
 			case header.asked == 0 && (waited < first*3/4 || waited >= first*5/4):
 				t.Errorf("%s, %q: waited %v, want the backoff's %v, a quarter less or more", name, value, waited, first)
-			case header.asked != 0 && waited != header.asked:
-				t.Errorf("%s, %q: waited %v, want %v", name, value, waited, header.asked)
+			case header.asked == longest && waited != longest:
+				t.Errorf("%s, %q: waited %v, want the %v of MaxBackoff", name, value, waited, longest)
+			case header.asked != 0 && (waited < header.asked || waited > min(header.asked*5/4, longest)):
+				t.Errorf("%s, %q: waited %v, want %v and a quarter more at most", name, value, waited, header.asked)
 			}
 		}
 	})
 }
 
+// TestARetryAfterIsSpread: the wait a Retry-After asks for is drawn from
+// what it asks to a quarter more, and to MaxBackoff when that is less, with
+// none on MaxBackoff itself.
+func TestARetryAfterIsSpread(t *testing.T) {
+	t.Parallel()
+
+	const (
+		longest = time.Minute
+		rounds  = 500
+	)
+
+	for asked, most := range map[time.Duration]time.Duration{
+		4 * time.Second:  5 * time.Second,
+		48 * time.Second: longest,
+		50 * time.Second: longest,
+	} {
+		waited := clocked(
+			t,
+			rounds,
+			retry.Options{Retries: 1, Backoff: time.Millisecond, MaxBackoff: longest},
+			failing(1, answer{
+				status: http.StatusServiceUnavailable,
+				header: http.Header{"Retry-After": {strconv.Itoa(int(asked / time.Second))}},
+			}),
+		)
+
+		drawn(t, "a Retry-After of "+asked.String(), before(t, waited, 1), asked, most)
+	}
+}
+
+// TestTheLongerOfBackoffAndRetryAfterIsWaited: a Retry-After that asks for
+// less than the backoff does not shorten it.
+func TestTheLongerOfBackoffAndRetryAfterIsWaited(t *testing.T) {
+	t.Parallel()
+
+	const first = 8 * time.Second
+
+	waited := clocked(
+		t,
+		500,
+		retry.Options{Retries: 1, Backoff: first, MaxBackoff: time.Minute},
+		failing(1, answer{
+			status: http.StatusServiceUnavailable,
+			header: http.Header{"Retry-After": {"1"}},
+		}),
+	)
+
+	drawn(t, "a Retry-After of a second, a Backoff of eight", before(t, waited, 1), first*3/4, first*5/4)
+}
+
 // TestBackoff: the wait before each retry is drawn between three quarters
-// and five quarters of Backoff doubled each time, and is MaxBackoff at most.
+// and five quarters of Backoff doubled each time, or to MaxBackoff when that
+// is less, and never on it.
 func TestBackoff(t *testing.T) {
 	t.Parallel()
 
@@ -305,8 +346,8 @@ func TestBackoff(t *testing.T) {
 	// 40ms, 80ms, then 160ms and 320ms cut to the 100ms of MaxBackoff.
 	drawn(t, "retry 1", before(t, waited, 1), 30*time.Millisecond, 50*time.Millisecond)
 	drawn(t, "retry 2", before(t, waited, 2), 60*time.Millisecond, 100*time.Millisecond)
-	capped(t, "retry 3", before(t, waited, 3), 75*time.Millisecond, longest)
-	capped(t, "retry 4", before(t, waited, 4), 75*time.Millisecond, longest)
+	drawn(t, "retry 3", before(t, waited, 3), 75*time.Millisecond, longest)
+	drawn(t, "retry 4", before(t, waited, 4), 75*time.Millisecond, longest)
 }
 
 // TestBackoffAtTheEdges: a Backoff past MaxBackoff waits as MaxBackoff does;
@@ -332,8 +373,8 @@ func TestBackoffAtTheEdges(t *testing.T) {
 			failing(2, answer{err: errFlaky}),
 		)
 
-		capped(t, name+", retry 1", before(t, waited, 1), longest*3/4, longest)
-		capped(t, name+", retry 2", before(t, waited, 2), longest*3/4, longest)
+		drawn(t, name+", retry 1", before(t, waited, 1), longest*3/4, longest)
+		drawn(t, name+", retry 2", before(t, waited, 2), longest*3/4, longest)
 	}
 
 	waited := clocked(
@@ -365,7 +406,7 @@ func TestBackoffAtTheEdges(t *testing.T) {
 		late = append(late, before(t, waited, nth)...)
 	}
 
-	capped(t, "retries 6 to 80", late, longest*3/4, longest)
+	drawn(t, "retries 6 to 80", late, longest*3/4, longest)
 }
 
 // TestRetries: a request is sent again Retries times, and no more.
@@ -405,11 +446,14 @@ func TestTheDefaults(t *testing.T) {
 			header: http.Header{"Retry-After": {strconv.Itoa(int(asked / time.Second))}},
 		}))
 
+		const longest = 30 * time.Second
+
 		switch {
 		case !again && len(waited[0]) != 0:
 			t.Errorf("with no MaxBackoff named, a Retry-After of %v was obeyed, with a wait of %v", asked, waited[0])
-		case again && (len(waited[0]) != 1 || waited[0][0] != asked):
-			t.Errorf("with no MaxBackoff named, a Retry-After of %v: waits %v, want that one", asked, waited[0])
+		case again && (len(waited[0]) != 1 || waited[0][0] < asked || waited[0][0] > longest):
+			t.Errorf("with no MaxBackoff named, a Retry-After of %v: waits %v, want one from that to %v",
+				asked, waited[0], longest)
 		}
 	}
 }

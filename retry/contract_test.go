@@ -26,9 +26,12 @@ package retry_test
 //     server has yet to send of it is not waited for. A context cancelled
 //     during the wait ends it, and the error is the context's, holding the
 //     attempt's error if it had one;
-//   - the wait before a retry is at least three quarters of Backoff doubled
-//     each time, and never longer than MaxBackoff; a Retry-After that asks
-//     for longer is obeyed;
+//   - the wait before a retry is drawn evenly between three quarters and
+//     five quarters of Backoff doubled each time up to MaxBackoff, or to
+//     MaxBackoff when that is less: no wait is longer, and they do not
+//     gather on it. A Retry-After that asks for longer is obeyed (RFC 9110,
+//     10.2.3: "how long the user agent ought to wait"), drawn evenly from
+//     what it asks to a quarter more, or to MaxBackoff;
 //   - the caller's request is left as it was, and is the response's Request;
 //     a trailer the caller sets while the body is read is sent with each
 //     attempt;

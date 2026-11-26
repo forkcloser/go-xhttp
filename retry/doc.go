@@ -46,12 +46,17 @@
 //
 // # Waiting
 //
-// The wait before a retry starts at [Options.Backoff] and doubles, each wait
-// a quarter longer or shorter at random, and is never longer than
-// [Options.MaxBackoff]. A Retry-After header, in seconds or as a date, is
-// obeyed when it asks for longer. A server that asks for more than MaxBackoff
-// is not asked again, and its response comes back. A wait that would outlast
-// the context's deadline is not begun.
+// The wait before a retry starts at [Options.Backoff] and doubles, up to
+// [Options.MaxBackoff]. Each is drawn at random between three quarters of
+// that and five quarters, or MaxBackoff when that is less, so that the
+// clients a server turned away together do not come back together. No wait
+// is longer than MaxBackoff.
+//
+// A Retry-After header, in seconds or as a date, is obeyed when it asks for
+// longer: the wait is what it asks and up to a quarter more, at random and
+// for the same reason, and MaxBackoff at most. A server that asks for more
+// than MaxBackoff is not asked again, and its response comes back. A wait
+// that would outlast the context's deadline is not begun.
 //
 // A retry is a log/slog record at the debug level, with the method, the host
 // and the cause, and never the path or the query.
