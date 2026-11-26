@@ -156,10 +156,7 @@ func TestABodyReadToItsEndHoldsNothing(t *testing.T) {
 func TestEveryWayOutLetsGoOfTheRequest(t *testing.T) {
 	t.Parallel()
 
-	const (
-		stall  = 50 * time.Millisecond
-		rounds = 10
-	)
+	const rounds = 10
 
 	release := make(chan struct{})
 	stops := stalling(nil, release)
@@ -221,8 +218,8 @@ func TestEveryWayOutLetsGoOfTheRequest(t *testing.T) {
 		Pin: pinned(t, strings.TrimPrefix(untrusted.URL, "https://"), strings.Repeat("ab", sha256.Size)),
 	})
 
-	one := xhttp.NewTransport(xhttp.Config{Cleartext: true, StallTimeout: stall})
-	second := xhttp.NewTransport(xhttp.Config{Roots: trusted, StallTimeout: stall})
+	one := xhttp.NewTransport(xhttp.Config{Cleartext: true, StallTimeout: patient})
+	second := xhttp.NewTransport(xhttp.Config{Roots: trusted, StallTimeout: patient})
 
 	// What the caller does with a response. Each expects the stall.
 	readToTheError := func(resp *http.Response) error {
@@ -266,33 +263,42 @@ func TestEveryWayOutLetsGoOfTheRequest(t *testing.T) {
 	} {
 		parent := counting()
 
+		// The rounds of a way go at once: some of them wait out the limit.
+		var group sync.WaitGroup
+
 		for range rounds {
-			req, err := http.NewRequestWithContext(parent, http.MethodGet, way.address, http.NoBody)
-			if err != nil {
-				t.Fatal(err)
-			}
+			group.Go(func() {
+				req, err := http.NewRequestWithContext(parent, http.MethodGet, way.address, http.NoBody)
+				if err != nil {
+					t.Error(err)
 
-			if strings.HasSuffix(way.address, "/switch") {
-				req.Header.Set("Connection", "Upgrade")
-				req.Header.Set("Upgrade", "echo")
-			}
-
-			resp, err := way.transport.RoundTrip(req)
-
-			switch {
-			case way.then == nil && err == nil:
-				_ = resp.Body.Close()
-
-				t.Fatalf("%s: answered %d, want an error", way.name, resp.StatusCode)
-			case way.then == nil:
-			case err != nil:
-				t.Fatalf("%s: %v", way.name, err)
-			default:
-				if err = way.then(resp); err != nil {
-					t.Fatalf("%s: %v", way.name, err)
+					return
 				}
-			}
+
+				if strings.HasSuffix(way.address, "/switch") {
+					req.Header.Set("Connection", "Upgrade")
+					req.Header.Set("Upgrade", "echo")
+				}
+
+				resp, err := way.transport.RoundTrip(req)
+
+				switch {
+				case way.then == nil && err == nil:
+					_ = resp.Body.Close()
+
+					t.Errorf("%s: answered %d, want an error", way.name, resp.StatusCode)
+				case way.then == nil:
+				case err != nil:
+					t.Errorf("%s: %v", way.name, err)
+				default:
+					if err = way.then(resp); err != nil {
+						t.Errorf("%s: %v", way.name, err)
+					}
+				}
+			})
 		}
+
+		group.Wait()
 
 		if left := parent.settles(); left != 0 {
 			t.Errorf("%s: %d contexts of %d requests are still held", way.name, left, rounds)

@@ -67,6 +67,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/forkcloser/xhttp"
@@ -614,161 +615,165 @@ func TestALookupThatMayPassIsTriedAgain(t *testing.T) {
 // TestADoneContextIsNotRetried: an attempt that ended under a context that
 // is done is the last, and its answer comes back; a deadline that leaves
 // room ends nothing; a wait the deadline would cut is not begun, and the
-// answer in hand comes back; a cancel during a wait ends the wait.
+// answer in hand comes back; a cancel during a wait ends the wait. It runs on
+// testing/synctest's clock, where the cancel falls inside the wait whatever
+// the machine is busy with, and the times are exact.
 func TestADoneContextIsNotRetried(t *testing.T) {
 	t.Parallel()
 
-	// Cancelled as the attempt ends: the attempt's own answer, error or
-	// response, and no wait.
-	for name, script := range map[string][]answer{
-		"an error": failing(4, answer{err: errFlaky}),
-		"a 503":    failing(4, answer{status: http.StatusServiceUnavailable}),
-	} {
-		ctx, cancel := context.WithCancel(t.Context())
+	synctest.Test(t, func(t *testing.T) {
+		// Cancelled as the attempt ends: the attempt's own answer, error or
+		// response, and no wait.
+		for name, script := range map[string][]answer{
+			"an error": failing(4, answer{err: errFlaky}),
+			"a 503":    failing(4, answer{status: http.StatusServiceUnavailable}),
+		} {
+			ctx, cancel := context.WithCancel(t.Context())
 
-		base := &scripted{script: script}
-		stopping := roundTripper(func(req *http.Request) (*http.Response, error) {
-			defer cancel()
+			base := &scripted{script: script}
+			stopping := roundTripper(func(req *http.Request) (*http.Response, error) {
+				defer cancel()
 
-			return base.RoundTrip(req)
-		})
+				return base.RoundTrip(req)
+			})
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://server.test/", http.NoBody)
-		if err != nil {
-			t.Fatal(err)
-		}
+			req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://server.test/", http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-		resp, err := retry.NewTransport(stopping, quick(3)).RoundTrip(req)
+			resp, err := retry.NewTransport(stopping, quick(3)).RoundTrip(req)
 
-		switch {
-		case len(base.attempts()) != 1:
-			t.Errorf("cancelled as the attempt ended in %s: %d attempts, want 1", name, len(base.attempts()))
-		//nolint:err113,errorlint // the error itself is the contract, not one that wraps it
-		case name == "an error" && err != errFlaky:
-			t.Errorf("cancelled as the attempt ended in %s = %v, want its own error", name, err)
-		case name == "a 503" && (err != nil || resp.StatusCode != http.StatusServiceUnavailable):
-			t.Errorf("cancelled as the attempt ended in %s = %v, %v; want the 503", name, resp, err)
-		}
+			switch {
+			case len(base.attempts()) != 1:
+				t.Errorf("cancelled as the attempt ended in %s: %d attempts, want 1", name, len(base.attempts()))
+			//nolint:err113,errorlint // the error itself is the contract, not one that wraps it
+			case name == "an error" && err != errFlaky:
+				t.Errorf("cancelled as the attempt ended in %s = %v, want its own error", name, err)
+			case name == "a 503" && (err != nil || resp.StatusCode != http.StatusServiceUnavailable):
+				t.Errorf("cancelled as the attempt ended in %s = %v, %v; want the 503", name, resp, err)
+			}
 
-		if resp != nil {
-			_ = resp.Body.Close()
-		}
-	}
-
-	// A deadline that leaves room for the waits ends nothing.
-	roomy, enough := context.WithTimeout(t.Context(), time.Minute)
-	defer enough()
-
-	base := &scripted{script: failing(2, answer{status: http.StatusServiceUnavailable})}
-
-	req, err := http.NewRequestWithContext(roomy, http.MethodGet, "https://server.test/", http.NoBody)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	resp, err := retry.NewTransport(base, quick(3)).RoundTrip(req)
-	if err != nil || resp.StatusCode != http.StatusOK || len(base.attempts()) != 3 {
-		t.Fatalf(
-			"under a deadline a minute away: %v, %v after %d attempts; want 200 after 3",
-			resp,
-			err,
-			len(base.attempts()),
-		)
-	}
-
-	_ = resp.Body.Close()
-
-	for name, script := range map[string][]answer{
-		"after an error": failing(4, answer{err: errFlaky}),
-		"after a 503":    failing(4, answer{status: http.StatusServiceUnavailable}),
-	} {
-		// A deadline that falls inside the wait: the wait is not begun, and
-		// the answer in hand comes back at once.
-		base = &scripted{script: script}
-
-		bounded, stop := context.WithTimeout(t.Context(), 10*time.Second)
-
-		req, err = http.NewRequestWithContext(bounded, http.MethodGet, "https://server.test/", http.NoBody)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		started := time.Now()
-		minute := retry.Options{Retries: 3, Backoff: time.Minute, MaxBackoff: time.Minute}
-
-		resp, err = retry.NewTransport(base, minute).RoundTrip(req)
-
-		stop()
-
-		switch {
-		case len(base.attempts()) != 1 || time.Since(started) > 5*time.Second:
-			t.Errorf("%s, a deadline inside the wait: %d attempts in %v; want 1, at once",
-				name, len(base.attempts()), time.Since(started))
-		//nolint:err113,errorlint // the error itself is the contract, not one that wraps it
-		case name == "after an error" && err != errFlaky:
-			t.Errorf("%s, a deadline inside the wait = %v, want the attempt's own error", name, err)
-		case name == "after a 503" && (err != nil || resp.StatusCode != http.StatusServiceUnavailable):
-			t.Errorf("%s, a deadline inside the wait = %v, %v; want the 503", name, resp, err)
-		}
-
-		if resp != nil {
-			content, readErr := io.ReadAll(resp.Body)
-			_ = resp.Body.Close()
-
-			if readErr != nil || string(content) != "the answer's body" {
-				t.Errorf("%s, a deadline inside the wait: the body %q, %v; want it whole", name, content, readErr)
+			if resp != nil {
+				_ = resp.Body.Close()
 			}
 		}
 
-		// A cancel during the wait: the answer was given up to wait, and the
-		// error is the context's, holding the attempt's error if it had one.
-		base = &scripted{script: script}
+		// A deadline that leaves room for the waits ends nothing.
+		roomy, enough := context.WithTimeout(t.Context(), time.Minute)
+		defer enough()
 
-		waiting, cancelWait := context.WithCancel(t.Context())
-		timer := time.AfterFunc(50*time.Millisecond, cancelWait)
+		base := &scripted{script: failing(2, answer{status: http.StatusServiceUnavailable})}
 
-		rewinds := &tracked{Reader: strings.NewReader("content")}
-
-		req, err = http.NewRequestWithContext(
-			waiting,
-			http.MethodPut,
-			"https://server.test/",
-			strings.NewReader("content"),
-		)
+		req, err := http.NewRequestWithContext(roomy, http.MethodGet, "https://server.test/", http.NoBody)
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		req.GetBody = func() (io.ReadCloser, error) { return rewinds, nil }
-
-		started = time.Now()
-
-		resp, err = retry.NewTransport(base, minute).RoundTrip(req)
-		if resp != nil {
-			_ = resp.Body.Close()
+		resp, err := retry.NewTransport(base, quick(3)).RoundTrip(req)
+		if err != nil || resp.StatusCode != http.StatusOK || len(base.attempts()) != 3 {
+			t.Fatalf(
+				"under a deadline a minute away: %v, %v after %d attempts; want 200 after 3",
+				resp,
+				err,
+				len(base.attempts()),
+			)
 		}
 
-		timer.Stop()
-		cancelWait()
+		_ = resp.Body.Close()
 
-		if !errors.Is(err, context.Canceled) || len(base.attempts()) != 1 {
-			t.Errorf("%s, a cancel during the wait = %v after %d attempts; want the context's error after 1",
-				name, err, len(base.attempts()))
-		}
+		for name, script := range map[string][]answer{
+			"after an error": failing(4, answer{err: errFlaky}),
+			"after a 503":    failing(4, answer{status: http.StatusServiceUnavailable}),
+		} {
+			// A deadline that falls inside the wait: the wait is not begun, and
+			// the answer in hand comes back at once.
+			base = &scripted{script: script}
 
-		if name == "after an error" && !errors.Is(err, errFlaky) {
-			t.Errorf("%s: %v does not hold the error of the attempt before", name, err)
-		}
+			bounded, stop := context.WithTimeout(t.Context(), 10*time.Second)
 
-		if !rewinds.closed.Load() {
-			t.Errorf("%s: the body taken for the retry that was not made was left open", name)
-		}
+			req, err = http.NewRequestWithContext(bounded, http.MethodGet, "https://server.test/", http.NoBody)
+			if err != nil {
+				t.Fatal(err)
+			}
 
-		// A minute's backoff, cut at the cancel's 50 milliseconds.
-		if waited := time.Since(started); waited > 30*time.Second {
-			t.Errorf("%s: the wait went on %v past its context", name, waited)
+			started := time.Now()
+			minute := retry.Options{Retries: 3, Backoff: time.Minute, MaxBackoff: time.Minute}
+
+			resp, err = retry.NewTransport(base, minute).RoundTrip(req)
+
+			stop()
+
+			switch {
+			case len(base.attempts()) != 1 || time.Since(started) != 0:
+				t.Errorf("%s, a deadline inside the wait: %d attempts in %v; want 1, at once",
+					name, len(base.attempts()), time.Since(started))
+			//nolint:err113,errorlint // the error itself is the contract, not one that wraps it
+			case name == "after an error" && err != errFlaky:
+				t.Errorf("%s, a deadline inside the wait = %v, want the attempt's own error", name, err)
+			case name == "after a 503" && (err != nil || resp.StatusCode != http.StatusServiceUnavailable):
+				t.Errorf("%s, a deadline inside the wait = %v, %v; want the 503", name, resp, err)
+			}
+
+			if resp != nil {
+				content, readErr := io.ReadAll(resp.Body)
+				_ = resp.Body.Close()
+
+				if readErr != nil || string(content) != "the answer's body" {
+					t.Errorf("%s, a deadline inside the wait: the body %q, %v; want it whole", name, content, readErr)
+				}
+			}
+
+			// A cancel during the wait: the answer was given up to wait, and the
+			// error is the context's, holding the attempt's error if it had one.
+			base = &scripted{script: script}
+
+			waiting, cancelWait := context.WithCancel(t.Context())
+			timer := time.AfterFunc(50*time.Millisecond, cancelWait)
+
+			rewinds := &tracked{Reader: strings.NewReader("content")}
+
+			req, err = http.NewRequestWithContext(
+				waiting,
+				http.MethodPut,
+				"https://server.test/",
+				strings.NewReader("content"),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			req.GetBody = func() (io.ReadCloser, error) { return rewinds, nil }
+
+			started = time.Now()
+
+			resp, err = retry.NewTransport(base, minute).RoundTrip(req)
+			if resp != nil {
+				_ = resp.Body.Close()
+			}
+
+			timer.Stop()
+			cancelWait()
+
+			if !errors.Is(err, context.Canceled) || len(base.attempts()) != 1 {
+				t.Errorf("%s, a cancel during the wait = %v after %d attempts; want the context's error after 1",
+					name, err, len(base.attempts()))
+			}
+
+			if name == "after an error" && !errors.Is(err, errFlaky) {
+				t.Errorf("%s: %v does not hold the error of the attempt before", name, err)
+			}
+
+			if !rewinds.closed.Load() {
+				t.Errorf("%s: the body taken for the retry that was not made was left open", name)
+			}
+
+			// A minute's backoff, cut at the cancel's 50 milliseconds.
+			if waited := time.Since(started); waited != 50*time.Millisecond {
+				t.Errorf("%s: the wait ended after %v, want the 50ms of its context", name, waited)
+			}
 		}
-	}
+	})
 }
 
 // roundTripper makes a transport of a function.

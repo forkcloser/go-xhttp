@@ -379,7 +379,17 @@ func TestWhatARefusedHandshakeIs(t *testing.T) {
 			_, _ = io.CopyN(io.Discard, conn, int64(header[3])<<8|int64(header[4]))
 		}
 	})
+
+	// A context that ends when the server has the first byte of the
+	// ClientHello, and never answers it: the middle of a handshake.
+	inTheMiddle, leave := context.WithCancel(t.Context())
+	defer leave()
+
 	silent := "https://" + answeringEachConnection(t, func(conn net.Conn) {
+		_, _ = conn.Read(make([]byte, 1))
+
+		leave()
+
 		_, _ = io.Copy(io.Discard, conn)
 	})
 
@@ -400,12 +410,8 @@ func TestWhatARefusedHandshakeIs(t *testing.T) {
 		})
 	}
 
-	// Shorter than the ten seconds a handshake is given.
-	soon, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
-	defer cancel()
-
 	for name, server := range map[string]struct {
-		ctx     context.Context //nolint:containedctx // one case of the table has a deadline
+		ctx     context.Context //nolint:containedctx // one case of the table ends its own
 		address string
 		config  xhttp.Config
 		refused bool
@@ -427,7 +433,7 @@ func TestWhatARefusedHandshakeIs(t *testing.T) {
 		},
 		"a server that resets the connection on the ClientHello": {t.Context(), resetting, xhttp.Config{}, false},
 		"a server that ends the connection on the ClientHello":   {t.Context(), ending, xhttp.Config{}, false},
-		"a context that ends in the middle of the handshake":     {soon, silent, xhttp.Config{}, false},
+		"a context that ends in the middle of the handshake":     {inTheMiddle, silent, xhttp.Config{}, false},
 		"a certificate that is not trusted":                      {t.Context(), untrusted.URL, xhttp.Config{}, false},
 		"a server that wants a client certificate, in TLS 1.3": {
 			t.Context(), demanding.URL, xhttp.Config{Roots: demandingRoots}, false,
@@ -486,6 +492,18 @@ func TestAnUntrustedServerIsTheStandardLibrarysError(t *testing.T) {
 		}
 	}
 }
+
+// patient is the StallTimeout of every test here that sets one. Each has a
+// server that behaves beat it: an answer that begins, a body that goes on, a
+// connection hung up on. That takes a millisecond on an idle machine, and
+// hundreds of them on one that runs every other test at once under the race
+// detector, so the limit is no shorter than this; a test waits it out once
+// for each stall it provokes.
+//
+// What has to be longer than the limit is longer by half of it when it only
+// has to be seen to outlast it (a timer never fires early), and by the whole
+// of it when something else has to happen first.
+const patient = 2 * time.Second
 
 // stalling serves "/stops", a body that starts and never ends, and "/paused",
 // one whose second half is sent when resume is.
@@ -574,10 +592,6 @@ func open(t *testing.T, client *http.Client, address string, major int) *http.Re
 func TestStalledBody(t *testing.T) {
 	t.Parallel()
 
-	// Long enough that the second half, sent when the pause ends, arrives
-	// well within it on a slow machine.
-	const stall = 500 * time.Millisecond
-
 	versions(t, func(t *testing.T, major int, serve func(http.Handler) (string, xhttp.Config)) {
 		t.Helper()
 
@@ -589,7 +603,7 @@ func TestStalledBody(t *testing.T) {
 		// are released first.
 		t.Cleanup(func() { close(release) })
 
-		config.StallTimeout = stall
+		config.StallTimeout = patient
 		client := xhttp.NewClient(config)
 
 		stopped := open(t, client, address+"/stops", major)
@@ -623,7 +637,7 @@ func TestStalledBody(t *testing.T) {
 		}
 
 		// Longer than the limit, and nobody is reading: not a stall.
-		time.Sleep(3 * stall)
+		time.Sleep(patient + patient/2)
 
 		resume <- struct{}{}
 
@@ -643,8 +657,6 @@ func TestStalledBody(t *testing.T) {
 func TestAResponseThatDoesNotBegin(t *testing.T) {
 	t.Parallel()
 
-	const stall = 200 * time.Millisecond
-
 	versions(t, func(t *testing.T, _ int, serve func(http.Handler) (string, xhttp.Config)) {
 		t.Helper()
 
@@ -658,7 +670,8 @@ func TestAResponseThatDoesNotBegin(t *testing.T) {
 
 			select {
 			case <-wait:
-			case <-time.After(3 * stall):
+			// The limit has to end the request first.
+			case <-time.After(2 * patient):
 				if wait == nil {
 					_, _ = w.Write([]byte("content"))
 				}
@@ -668,7 +681,7 @@ func TestAResponseThatDoesNotBegin(t *testing.T) {
 
 		t.Cleanup(func() { close(release) })
 
-		config.StallTimeout = stall
+		config.StallTimeout = patient
 		limited := xhttp.NewClient(config)
 
 		// Far past the limit: what ends a request the limit did not.
@@ -689,8 +702,8 @@ func TestAResponseThatDoesNotBegin(t *testing.T) {
 			}
 
 			// A timer never fires early.
-			if waited := time.Since(started); waited < stall {
-				t.Errorf("%s: failed after %v, before the %v of the limit", path, waited, stall)
+			if waited := time.Since(started); waited < patient {
+				t.Errorf("%s: failed after %v, before the %v of the limit", path, waited, patient)
 			}
 		}
 
@@ -739,8 +752,6 @@ func (endless) Close() error { return nil }
 func TestARequestTheServerStopsTaking(t *testing.T) {
 	t.Parallel()
 
-	const stall = 300 * time.Millisecond
-
 	versions(t, func(t *testing.T, _ int, serve func(http.Handler) (string, xhttp.Config)) {
 		t.Helper()
 
@@ -761,7 +772,7 @@ func TestARequestTheServerStopsTaking(t *testing.T) {
 
 		t.Cleanup(func() { close(release) })
 
-		config.StallTimeout = stall
+		config.StallTimeout = patient
 		transport := xhttp.NewTransport(config)
 
 		// Far past the limit: what ends a request the limit did not.
@@ -797,13 +808,15 @@ func TestARequestTheServerStopsTaking(t *testing.T) {
 		}
 
 		// A timer never fires early.
-		if waited := time.Since(started); waited < stall {
-			t.Errorf("a body the server reads none of: failed after %v, before the %v of the limit", waited, stall)
+		if waited := time.Since(started); waited < patient {
+			t.Errorf("a body the server reads none of: failed after %v, before the %v of the limit", waited, patient)
 		}
 
-		// Two reads of twice the limit each: the second while the server
+		// Two reads, each longer than the limit: the second while the server
 		// has had the first for longer than the limit.
-		if status, err := put("/reads", &lingering{wait: 2 * stall, pieces: 2}); err != nil || status != http.StatusOK {
+		lingers := &lingering{wait: patient + patient/2, pieces: 2}
+
+		if status, err := put("/reads", lingers); err != nil || status != http.StatusOK {
 			t.Errorf("a body that takes its time, to a server that reads it: %d, %v; want 200", status, err)
 		}
 	})
@@ -812,11 +825,11 @@ func TestARequestTheServerStopsTaking(t *testing.T) {
 // TestTheBodyNetHTTPTakesAgainIsReadThroughTheWaitToo: when a connection of
 // its pool turns out closed, net/http sends the request a second time
 // itself, with a body it takes from GetBody. That body's reads are still the
-// caller's time: three of twice the limit each, and the request is answered.
+// caller's time: two, each longer than the limit, and the request is answered.
+// The limit is what the first connection's hanging up, and net/http's taking
+// another, have to beat.
 func TestTheBodyNetHTTPTakesAgainIsReadThroughTheWaitToo(t *testing.T) {
 	t.Parallel()
-
-	const stall = 150 * time.Millisecond
 
 	var connections atomic.Int32
 
@@ -843,7 +856,7 @@ func TestTheBodyNetHTTPTakesAgainIsReadThroughTheWaitToo(t *testing.T) {
 		}
 	})
 
-	transport := xhttp.NewTransport(xhttp.Config{Cleartext: true, StallTimeout: stall})
+	transport := xhttp.NewTransport(xhttp.Config{Cleartext: true, StallTimeout: patient})
 
 	// One request, so that the next travels on a connection of the pool.
 	warm, err := http.NewRequestWithContext(t.Context(), http.MethodGet, address, http.NoBody)
@@ -877,7 +890,7 @@ func TestTheBodyNetHTTPTakesAgainIsReadThroughTheWaitToo(t *testing.T) {
 	req.GetBody = func() (io.ReadCloser, error) {
 		taken++
 
-		return &lingering{wait: 2 * stall, pieces: 3}, nil
+		return &lingering{wait: patient + patient/2, pieces: 2}, nil
 	}
 
 	resp, err = transport.RoundTrip(req)
@@ -900,10 +913,7 @@ func TestTheBodyNetHTTPTakesAgainIsReadThroughTheWaitToo(t *testing.T) {
 func TestAnAnswerEndsTheWaitForIt(t *testing.T) {
 	t.Parallel()
 
-	const (
-		stall  = 300 * time.Millisecond
-		pieces = 12
-	)
+	const pieces = 12
 
 	versions(t, func(t *testing.T, _ int, serve func(http.Handler) (string, xhttp.Config)) {
 		t.Helper()
@@ -918,17 +928,17 @@ func TestAnAnswerEndsTheWaitForIt(t *testing.T) {
 				_ = control.Flush()
 
 				select {
-				case <-time.After(stall / 6):
+				case <-time.After(patient / 6):
 				case <-r.Context().Done():
 					return
 				}
 			}
 		}))
 
-		config.StallTimeout = stall
+		config.StallTimeout = patient
 
 		// The body is sent a third of the limit after the answer began.
-		req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, address, &lingering{wait: stall / 3})
+		req, err := http.NewRequestWithContext(t.Context(), http.MethodPut, address, &lingering{wait: patient / 3})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1052,7 +1062,8 @@ func TestTheZeroConfigWatchesForAStall(t *testing.T) {
 func TestANegativeStallTimeoutWaitsForEver(t *testing.T) {
 	t.Parallel()
 
-	const pause = 300 * time.Millisecond
+	// The limit has to end the read before the pause does.
+	const pause = 2 * patient
 
 	pausing := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("first"))
@@ -1071,7 +1082,7 @@ func TestANegativeStallTimeoutWaitsForEver(t *testing.T) {
 
 		address, config := serve(pausing)
 
-		config.StallTimeout = pause / 3
+		config.StallTimeout = patient
 		limited := open(t, xhttp.NewClient(config), address, major)
 
 		_, err := io.ReadAll(limited.Body)
@@ -1140,8 +1151,6 @@ func TestCloseWhileReading(t *testing.T) {
 func TestAProtocolSwitchIsNotWatched(t *testing.T) {
 	t.Parallel()
 
-	const stall = 100 * time.Millisecond
-
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		conn, buffered, err := http.NewResponseController(w).Hijack()
 		if err != nil {
@@ -1167,7 +1176,7 @@ func TestAProtocolSwitchIsNotWatched(t *testing.T) {
 	req.Header.Set("Connection", "Upgrade")
 	req.Header.Set("Upgrade", "echo")
 
-	resp, err := xhttp.NewClient(xhttp.Config{Cleartext: true, StallTimeout: stall}).Do(req)
+	resp, err := xhttp.NewClient(xhttp.Config{Cleartext: true, StallTimeout: patient}).Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1187,7 +1196,7 @@ func TestAProtocolSwitchIsNotWatched(t *testing.T) {
 	}()
 
 	// The read waits longer than the limit, with nothing arriving.
-	time.Sleep(3 * stall)
+	time.Sleep(patient + patient/2)
 
 	if _, err = stream.Write([]byte("echo")); err != nil {
 		t.Fatal(err)

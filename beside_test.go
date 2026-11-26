@@ -18,7 +18,6 @@ import (
 	"sync"
 	"testing"
 	"testing/iotest"
-	"time"
 
 	"github.com/forkcloser/xhttp"
 )
@@ -241,10 +240,7 @@ func TestAnErrorThatIsNotThePackagesIsNetHTTPs(t *testing.T) {
 func TestOneTransportCarriesManyRequestsAtOnce(t *testing.T) {
 	t.Parallel()
 
-	const (
-		callers = 64
-		stall   = 200 * time.Millisecond
-	)
+	const callers = 64
 
 	versions(t, func(t *testing.T, _ int, serve func(http.Handler) (string, xhttp.Config)) {
 		t.Helper()
@@ -264,7 +260,7 @@ func TestOneTransportCarriesManyRequestsAtOnce(t *testing.T) {
 
 		t.Cleanup(func() { close(release) })
 
-		config.StallTimeout = stall
+		config.StallTimeout = patient
 		transport := xhttp.NewTransport(config)
 
 		var group sync.WaitGroup
