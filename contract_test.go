@@ -379,7 +379,17 @@ func TestWhatARefusedHandshakeIs(t *testing.T) {
 			_, _ = io.CopyN(io.Discard, conn, int64(header[3])<<8|int64(header[4]))
 		}
 	})
+
+	// A context that ends when the server has the first byte of the
+	// ClientHello, and never answers it: the middle of a handshake.
+	inTheMiddle, leave := context.WithCancel(t.Context())
+	defer leave()
+
 	silent := "https://" + answeringEachConnection(t, func(conn net.Conn) {
+		_, _ = conn.Read(make([]byte, 1))
+
+		leave()
+
 		_, _ = io.Copy(io.Discard, conn)
 	})
 
@@ -400,12 +410,8 @@ func TestWhatARefusedHandshakeIs(t *testing.T) {
 		})
 	}
 
-	// Shorter than the ten seconds a handshake is given.
-	soon, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
-	defer cancel()
-
 	for name, server := range map[string]struct {
-		ctx     context.Context //nolint:containedctx // one case of the table has a deadline
+		ctx     context.Context //nolint:containedctx // one case of the table ends its own
 		address string
 		config  xhttp.Config
 		refused bool
@@ -427,7 +433,7 @@ func TestWhatARefusedHandshakeIs(t *testing.T) {
 		},
 		"a server that resets the connection on the ClientHello": {t.Context(), resetting, xhttp.Config{}, false},
 		"a server that ends the connection on the ClientHello":   {t.Context(), ending, xhttp.Config{}, false},
-		"a context that ends in the middle of the handshake":     {soon, silent, xhttp.Config{}, false},
+		"a context that ends in the middle of the handshake":     {inTheMiddle, silent, xhttp.Config{}, false},
 		"a certificate that is not trusted":                      {t.Context(), untrusted.URL, xhttp.Config{}, false},
 		"a server that wants a client certificate, in TLS 1.3": {
 			t.Context(), demanding.URL, xhttp.Config{Roots: demandingRoots}, false,
