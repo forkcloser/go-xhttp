@@ -15,7 +15,10 @@ type Config struct {
 	TLS TLSLevel
 	// Roots is the certificate authorities trusted; the system's when nil.
 	Roots *x509.CertPool
-	// Proxy picks a request's proxy; http.ProxyFromEnvironment when nil.
+	// Proxy picks a request's proxy; http.ProxyFromEnvironment when nil,
+	// which net/http reads once for the process. A proxy whose URL holds
+	// credentials is reached over https only, or the request fails with
+	// [ErrCleartext], unless Cleartext.
 	Proxy func(*http.Request) (*url.URL, error)
 	// StallTimeout is how long the server may stay silent: before it takes
 	// more of the request's body, before its response begins once the
@@ -26,11 +29,13 @@ type Config struct {
 	// two reads of the response. Zero is one minute; a negative value waits
 	// for ever, with the request's context as the one limit.
 	StallTimeout time.Duration
-	// UserAgent is the User-Agent of a request that has no such header;
-	// Go's own when empty.
+	// UserAgent is the User-Agent of a request that has no such header,
+	// and of the CONNECT that opens a tunnel through a proxy; Go's own
+	// when empty.
 	UserAgent string
-	// Cleartext sends a request that is not https. Without it, such a
-	// request fails with [ErrCleartext].
+	// Cleartext sends a request that is not https, and a proxy's
+	// credentials over a connection that is not. Without it, either fails
+	// the request with [ErrCleartext].
 	Cleartext bool
 	// Offline fails every request with [ErrOffline], before anything is
 	// dialed.

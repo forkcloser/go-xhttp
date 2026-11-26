@@ -5,8 +5,9 @@ import "errors"
 var (
 	// ErrOffline is the error of every request through an offline transport.
 	ErrOffline = errors.New("offline")
-	// ErrCleartext is the error of a request that is not https, through a
-	// transport that was not told to send one.
+	// ErrCleartext is the error of a request that is not https, or whose
+	// proxy is given credentials and is not reached over https, through a
+	// transport that was not told to send cleartext.
 	ErrCleartext = errors.New("not https")
 	// ErrHandshakeRefused is the error of a TLS handshake that failed, when
 	// neither the server's certificate nor the network is the cause: most

@@ -3,8 +3,8 @@
 The client side of `net/http` under a posture. `xhttp` returns the standard
 library's own types, an `*http.Client` and an `http.RoundTripper`, built from
 a `Config` whose zero value is the strictest setting. Whatever is weaker is
-asked for by name. Nothing reads or writes a global, so a library uses it as
-a program does.
+asked for by name. It keeps no state of its own, so a library uses it as a
+program does.
 
 ```go
 import (
@@ -21,6 +21,7 @@ client.Transport = retry.NewTransport(client.Transport, retry.Options{Retries: 3
 | Protection | The zero `Config` | Asked for by name |
 |---|---|---|
 | Scheme | https only, `ErrCleartext` otherwise | `Config.Cleartext` |
+| Proxy | the environment's; credentials for it over https only, `ErrCleartext` otherwise | `Config.Proxy`, `Config.Cleartext` |
 | TLS | `HybridOnly`: TLS 1.3, post-quantum hybrid key exchanges only | `Config.TLS`: `Classical`, `Legacy`, for the whole transport |
 | Silent server | a request the server stops taking for a minute, a response that has not begun a minute after the request was sent, or a read of its body that waits a minute for a byte, fails with `ErrStalled` | `Config.StallTimeout`, negative to wait for ever |
 | Redirects | none from https to anything else, under any client; at most 10 under `NewClient` | a client of your own, for another limit |

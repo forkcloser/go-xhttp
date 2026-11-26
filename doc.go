@@ -1,8 +1,10 @@
 // Package xhttp is the client side of net/http under a posture. [NewTransport]
 // and [NewClient] return the standard library's own types, built from a
 // [Config] whose zero value is the strictest setting: whatever is weaker is
-// asked for by name. Nothing in the package reads or writes a global, so a
-// library uses it as a program does, and two transports share nothing.
+// asked for by name. The package keeps no state of its own, so a library
+// uses it as a program does: two transports share nothing but what the
+// standard library shares, the system's roots and the proxy the environment
+// names, which net/http reads once for the process.
 //
 // # The baseline
 //
@@ -22,7 +24,11 @@
 //     closes an HTTP/2 connection that answers no ping. The exchange as a
 //     whole has no limit but the request's context;
 //   - trusts the system's roots and takes its proxy from the environment,
-//     unless [Config.Roots] or [Config.Proxy] say otherwise.
+//     unless [Config.Roots] or [Config.Proxy] say otherwise. A proxy that is
+//     given credentials is reached over https, or the request fails with
+//     [ErrCleartext]; one that is given none may be reached in cleartext,
+//     and sees the host and port it is asked to connect to and no more of
+//     an https request.
 //
 // A transport carries no request that a redirect leads to from https to
 // anything else, whatever client follows the redirect, and a client from
@@ -36,8 +42,9 @@
 // for what a caller does on it:
 //
 //   - [ErrOffline]: the transport was told to be offline. Nothing was dialed.
-//   - [ErrCleartext]: the request is not https. Fix the URL, or make the
-//     transport with Config.Cleartext.
+//   - [ErrCleartext]: the request is not https, or its proxy's credentials
+//     would travel in cleartext. Fix the URL, or make the transport with
+//     Config.Cleartext.
 //   - [ErrHandshakeRefused]: the TLS handshake failed, and neither the
 //     server's certificate nor the network is the cause. Most often the
 //     server has nothing the transport's level accepts, which no retry

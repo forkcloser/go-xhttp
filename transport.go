@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptrace"
+	"net/url"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -48,19 +49,22 @@ type transport struct {
 // its own. Its CloseIdleConnections is the one http.Client calls. It panics
 // on a TLSLevel there is none of.
 func NewTransport(config Config) http.RoundTripper {
-	proxy := config.Proxy
-	if proxy == nil {
-		proxy = http.ProxyFromEnvironment
-	}
-
 	stall := config.StallTimeout
 	if stall == 0 {
 		stall = stallTimeout
 	}
 
+	// The CONNECT that opens a tunnel through a proxy is net/http's own
+	// request, and has no other way to the transport's User-Agent.
+	var toProxy http.Header
+	if config.UserAgent != "" {
+		toProxy = http.Header{"User-Agent": {config.UserAgent}}
+	}
+
 	return &transport{
 		base: &http.Transport{
-			Proxy:                 proxy,
+			Proxy:                 proxyOf(config),
+			ProxyConnectHeader:    toProxy,
 			DialContext:           (&net.Dialer{Timeout: dialTimeout, KeepAlive: dialKeepAlive}).DialContext,
 			ForceAttemptHTTP2:     true,
 			TLSClientConfig:       tlsConfig(config),
@@ -76,6 +80,29 @@ func NewTransport(config Config) http.RoundTripper {
 		userAgent: config.UserAgent,
 		cleartext: config.Cleartext,
 		offline:   config.Offline,
+	}
+}
+
+// proxyOf picks a request's proxy as config says, and refuses one that is
+// given credentials to send in cleartext: net/http sends those of an http
+// proxy as a header, and those of a SOCKS5 proxy as they are.
+func proxyOf(config Config) func(*http.Request) (*url.URL, error) {
+	pick := config.Proxy
+	if pick == nil {
+		pick = http.ProxyFromEnvironment
+	}
+
+	return func(req *http.Request) (*url.URL, error) {
+		proxy, err := pick(req)
+		if err != nil || proxy == nil {
+			return proxy, err
+		}
+
+		if proxy.User != nil && proxy.Scheme != https && !config.Cleartext {
+			return nil, fmt.Errorf("%w: credentials for the proxy %s://%s", ErrCleartext, proxy.Scheme, proxy.Host)
+		}
+
+		return proxy, nil
 	}
 }
 

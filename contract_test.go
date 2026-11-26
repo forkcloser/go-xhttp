@@ -35,7 +35,14 @@ package xhttp_test
 //     its transport lets go of the request at the body's end all the same);
 //   - the caller's request is left as it was, and is the response's Request;
 //     a trailer the caller sets while the body is read is sent;
-//   - UserAgent is the User-Agent of a request that has no such header;
+//   - UserAgent is the User-Agent of a request that has no such header, and
+//     of the CONNECT net/http sends a proxy for a tunnel;
+//   - a request's proxy is Config.Proxy's, or the environment's as net/http
+//     reads it (http.ProxyFromEnvironment); a proxy whose URL holds
+//     credentials is reached over https only, unless Cleartext: net/http
+//     sends them as a Proxy-Authorization header (RFC 9110, 11.7.2) to an
+//     http proxy, and as they are to a SOCKS5 one (RFC 1929), and the
+//     request fails with ErrCleartext before anything is dialed;
 //   - a Credential is made by NewCredential from a scheme that is an HTTP
 //     token (RFC 9110, 5.6.2 and 11.1), a token that net/http sends as it
 //     is in a header field (5.5: any octet but a control character other
@@ -66,9 +73,6 @@ package xhttp_test
 //     redirects and no more; both are ErrRedirect;
 //   - an error that is not the posture's is the standard library's, unchanged.
 //
-// That nothing reads or writes a global has no test: a read of
-// http.DefaultTransport shows in nothing a caller can see.
-
 import (
 	"bufio"
 	"context"
