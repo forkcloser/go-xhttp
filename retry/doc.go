@@ -36,11 +36,11 @@
 // read again after all.
 //
 // One case is an error of this package's making. A response that is to be
-// retried is closed before the wait, so that its connection carries the
-// retry; when the request's context is cancelled during that wait there is
-// no answer left to give, and the error is the context's. It wraps the
-// attempt's error when the attempt had failed, and names the status when it
-// had been answered.
+// retried is closed before the wait, and what the server had yet to send of
+// it is not read; when the request's context is cancelled during that wait
+// there is no answer left to give, and the error is the context's. It wraps
+// the attempt's error when the attempt had failed, and names the status when
+// it had been answered.
 //
 // # Waiting
 //

@@ -5,7 +5,6 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math/rand/v2"
 	"net"
@@ -21,11 +20,6 @@ const (
 	defaultBackoff    = 500 * time.Millisecond
 	defaultMaxBackoff = 30 * time.Second
 )
-
-// drainLimit is how much of a response given up on is read before it is
-// closed, so that its connection carries the retry. The body is the server's
-// to size: past the limit the connection is given up with it.
-const drainLimit = 64 << 10
 
 // Options is what varies between retrying transports. The zero value sends
 // each request once.
@@ -100,12 +94,13 @@ func (t *transport) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 
 		// What the attempt ended in: its error, or the status of a response,
-		// which is given up here.
+		// which is given up here. Closed and not read: a read waits for what
+		// the server has yet to send, for as long as the server likes.
 		status := 0
 		if resp != nil {
 			status = resp.StatusCode
 
-			drain(resp.Body)
+			_ = resp.Body.Close()
 		}
 
 		t.log(req, status, err, retry, wait)
@@ -326,13 +321,6 @@ func retryAfter(value string, limit time.Duration) (time.Duration, bool) {
 	wait := time.Until(date)
 
 	return max(wait, 0), wait <= limit
-}
-
-// drain reads what is left of a response given up on, within a limit, and
-// closes it.
-func drain(body io.ReadCloser) {
-	_, _ = io.CopyN(io.Discard, body, drainLimit)
-	_ = body.Close()
 }
 
 // sleep waits, or returns why the context ended first.

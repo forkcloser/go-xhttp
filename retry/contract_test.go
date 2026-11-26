@@ -19,9 +19,10 @@ package retry_test
 //     unchanged. That is when no retry is left, when Retry-After asks for
 //     more than MaxBackoff, when the context is done already or its deadline
 //     falls before the wait would end, and when GetBody fails;
-//   - a response given up on to wait is closed, and its connection carries
-//     the retry; a context cancelled during that wait ends it, and the error
-//     is the context's, holding the attempt's error if it had one;
+//   - a response given up on to wait is closed and not read: what the
+//     server has yet to send of it is not waited for. A context cancelled
+//     during the wait ends it, and the error is the context's, holding the
+//     attempt's error if it had one;
 //   - the wait before a retry is at least three quarters of Backoff doubled
 //     each time, and never longer than MaxBackoff; a Retry-After that asks
 //     for longer is obeyed;
@@ -32,10 +33,10 @@ package retry_test
 //   - the zero Options sends each request once; a nil base panics.
 
 import (
-	"bytes"
 	"context"
 	"crypto/tls"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -74,11 +75,19 @@ type attempt struct {
 	at     time.Time
 }
 
-// tracked is a response body that records its Close.
+// tracked is a response body that records its Close, and how often it was
+// read.
 type tracked struct {
 	io.Reader
 
 	closed atomic.Bool
+	reads  atomic.Int32
+}
+
+func (b *tracked) Read(into []byte) (int, error) {
+	b.reads.Add(1)
+
+	return b.Reader.Read(into)
 }
 
 func (b *tracked) Close() error {
@@ -216,7 +225,7 @@ func TestAnIdempotentRequestIsSentAgain(t *testing.T) {
 
 // TestWhatComesBackIsTheLastAttempts: the response whatever its status, as
 // a RoundTripper must, or the error itself; and every response given up on
-// is closed, the last one left to the caller.
+// is closed and was never read, the last one left to the caller.
 func TestWhatComesBackIsTheLastAttempts(t *testing.T) {
 	t.Parallel()
 
@@ -245,6 +254,10 @@ func TestWhatComesBackIsTheLastAttempts(t *testing.T) {
 	for index, body := range base.bodies {
 		if last := index == len(base.bodies)-1; body.closed.Load() == last {
 			t.Errorf("the body of attempt %d: closed %t, want %t", index+1, !last, last)
+		}
+
+		if reads := body.reads.Load(); reads != 0 {
+			t.Errorf("the body of attempt %d was read %d times before the caller had it", index+1, reads)
 		}
 	}
 
@@ -685,48 +698,66 @@ func TestTheCallersRequestIsLeftAsItWas(t *testing.T) {
 	}
 }
 
-// TestAResponseGivenUpOnLeavesItsConnection: the three attempts of one
-// request travel on one connection.
-func TestAResponseGivenUpOnLeavesItsConnection(t *testing.T) {
+// TestAResponseGivenUpOnIsNotWaitedFor: a server that answers 503 and then
+// holds the rest of its body does not hold the caller. The transport under
+// it is net/http's own, with no limit of its own on a body.
+func TestAResponseGivenUpOnIsNotWaitedFor(t *testing.T) {
 	t.Parallel()
 
-	var connections, requests atomic.Int32
+	var requests atomic.Int32
 
-	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		if requests.Add(1) < 3 {
-			w.WriteHeader(http.StatusServiceUnavailable)
-			_, _ = w.Write(bytes.Repeat([]byte("try later. "), 1000))
+	release := make(chan struct{})
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if requests.Add(1) > 1 {
+			return
+		}
+
+		w.Header().Set("Content-Length", "1000")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte("try later. "))
+		_ = http.NewResponseController(w).Flush()
+
+		select {
+		case <-release:
+		case <-r.Context().Done():
 		}
 	}))
-	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
-		if state == http.StateNew {
-			connections.Add(1)
-		}
-	}
-	server.Start()
 	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(release) })
 
-	client := xhttp.NewClient(xhttp.Config{Cleartext: true})
-	client.Transport = retry.NewTransport(client.Transport, quick(3))
+	standard := &http.Transport{}
+	t.Cleanup(standard.CloseIdleConnections)
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, server.URL, http.NoBody)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	resp, err := client.Do(req)
-	if err != nil {
-		t.Fatal(err)
-	}
+	answered := make(chan error, 1)
 
-	_ = resp.Body.Close()
+	go func() {
+		resp, err := retry.NewTransport(standard, quick(1)).RoundTrip(req)
+		if err == nil {
+			_ = resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK || requests.Load() != 3 {
-		t.Fatalf("status %d after %d requests; want 200 after 3", resp.StatusCode, requests.Load())
-	}
+			if resp.StatusCode != http.StatusOK {
+				err = fmt.Errorf("%w: status %d", errFlaky, resp.StatusCode)
+			}
+		}
 
-	if connections.Load() != 1 {
-		t.Errorf("the attempts travelled on %d connections, want 1", connections.Load())
+		answered <- err
+	}()
+
+	select {
+	case err := <-answered:
+		if err != nil || requests.Load() != 2 {
+			t.Errorf("%v after %d requests; want a 200 after 2", err, requests.Load())
+		}
+	// Far past what two requests to a local server take: the server holds
+	// its body until the test ends.
+	case <-time.After(30 * time.Second):
+		t.Fatal("RoundTrip waits for the rest of a response it gave up on")
 	}
 }
 
